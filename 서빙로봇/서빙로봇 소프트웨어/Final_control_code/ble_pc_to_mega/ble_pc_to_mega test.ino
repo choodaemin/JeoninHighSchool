@@ -18,6 +18,7 @@ enum SquareState {
   SQ_TURN_START,
   SQ_TURN_WAIT
 };
+
 SquareState squareState = SQ_FORWARD_START;
 unsigned long squareStateTime = 0;
 int squareStepCount = 0;

@@ -1,3 +1,4 @@
+"""
 # 과목 점수
 korean = 85
 english = 90
@@ -8,3 +9,8 @@ average = (korean + english + math) / 3
 
 # 결과 출력
 print(f"평균 점수: {average:.2f}")
+"""
+
+name = input('이름 입력')
+number = input('번호 입력')
+print(f"-"+name+"-"+number)

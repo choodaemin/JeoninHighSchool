@@ -11,29 +11,27 @@
 // =====================================================================
 
 // ── 물리 상수 (config.h와 동일) ──────────────────────────────────────
-static const float ODO_R   = 0.03f;          // 바퀴 반지름 (m)
-static const float ODO_CPR = 1440.0f;        // Counts Per Revolution
-// 1펄스당 이동 거리 (m) = 2pi * r / CPR
+static const float ODO_R = 0.03f;    // 바퀴 반지름 (m)
+static const float ODO_CPR = 411.3f; // Counts Per Revolution 보정 CPR = 617 ×
+                                     // (시리얼 X값 / 실제 이동거리)
+// 1펄스당 이동 거리 (m) = 2pi * r / CPR    // f=플로트인데 굳이 한번 더 하는
+// 이유는 변수가 확실하게 뭔지 구별하기 위해
 static const float ODO_DIST_PER_PULSE = (2.0f * PI * ODO_R) / ODO_CPR;
 
 // ── 위치 구조체 ───────────────────────────────────────────────────────
 struct OdoPose {
-  float x     = 0.0f;   // 월드 X 좌표 (m)
-  float y     = 0.0f;   // 월드 Y 좌표 (m)
-  float theta = 0.0f;   // 방향각 (라디안), IMU yaw에서 변환
+  float x = 0.0f;     // 월드 X 좌표 (m)
+  float y = 0.0f;     // 월드 Y 좌표 (m)
+  float theta = 0.0f; // 방향각 (라디안), IMU yaw에서 변환
 };
 
 OdoPose pose;
 
-// ── 내부 상태 ─────────────────────────────────────────────────────────
-static bool _odoFirst = true;
-
 // ── 리셋 함수 ─────────────────────────────────────────────────────────
 void resetOdometry() {
-  pose.x     = 0.0f;
-  pose.y     = 0.0f;
+  pose.x = 0.0f;
+  pose.y = 0.0f;
   pose.theta = 0.0f;
-  _odoFirst  = true;
 }
 
 // =====================================================================
@@ -44,20 +42,16 @@ void resetOdometry() {
 //    cA/cB/cC/cD 복사 직후에 호출하세요. (encXX 리셋 전)
 //
 //  [매개변수]
-//    pA, pB, pC, pD  : 100ms 동안 누적된 각 바퀴의 펄스 수 (양수)
+//    pA, pB, pC, pD  : 100ms 동안 누적된 각 바퀴의 펄스 수 (전진 +, 후진 -)
 //    currentYawDeg   : MPU9250에서 계산된 현재 yaw 값 (0~360도)
 //    turning         : 제자리 회전 중이면 true
 // =====================================================================
-void updateOdometry(long pA, long pB, long pC, long pD,
-                    float currentYawDeg, bool turning) {
+void updateOdometry(long pA, long pB, long pC, long pD, float currentYawDeg,
+                    bool turning) {
 
   // 제자리 회전 중에는 슬립 오차를 피하기 위해 갱신하지 않음
-  if (turning) return;
-
-  if (_odoFirst) {
-    _odoFirst = false;
+  if (turning)
     return;
-  }
 
   // ── ① 각 바퀴 이동 거리 (m) ──────────────────────────────────────
   float dA = pA * ODO_DIST_PER_PULSE;
@@ -82,7 +76,7 @@ void updateOdometry(long pA, long pB, long pC, long pD,
 
   pose.x += dx_local * cosT - dy_local * sinT;
   pose.y += dx_local * sinT + dy_local * cosT;
-  pose.theta = thetaRad;  // 각도는 IMU 값을 직접 사용 (더 정확)
+  pose.theta = thetaRad; // 각도는 IMU 값을 직접 사용 (더 정확)
 }
 
 // ── 시리얼 출력 헬퍼 ──────────────────────────────────────────────────
