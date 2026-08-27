@@ -34,17 +34,17 @@ unsigned long lastSpeedTime = 0;
 unsigned long lastRecvTime = 0; // 마지막 통신 수신 시점 (워치독용)
 
 // ── 주행 속도 및 가감속 제어 변수 ────────────────────────────
-int Motor_PWM = 125;             // 기본 주행 PWM 기준값
-float targetSpeed = 125.0;       // PID 엔코더 목표 속도
-int currentBasePWM = 0;          // 램프 가감속용 현재 PWM
-const int RAMP_ACCEL_STEP = 20;  // 100ms당 가속 폭 (약 0.6초에 목표 속도 도달)
-const int RAMP_DECEL_STEP = 30;  // 100ms당 감속 폭 (부드러운 정지)
+int Motor_PWM = 125;            // 기본 주행 PWM 기준값
+float targetSpeed = 125.0;      // PID 엔코더 목표 속도
+int currentBasePWM = 0;         // 램프 가감속용 현재 PWM
+const int RAMP_ACCEL_STEP = 20; // 100ms당 가속 폭 (약 0.6초에 목표 속도 도달)
+const int RAMP_DECEL_STEP = 30; // 100ms당 감속 폭 (부드러운 정지)
 
 int pwmA = 0, pwmB = 0, pwmC = 0, pwmD = 0;
 
 // 헤딩 보정 (Heading Lock) 전용 변수
 float targetHeading = 0.0;
-const float KP_HEADING = 2.0;    // 각도 1도 오차당 목표 속도 보정량 (튜닝 가능)
+const float KP_HEADING = 3.0; // 각도 1도 오차당 목표 속도 보정량 (튜닝 가능)
 
 // 각도 변수 (나노 BLE에서 YAW 수신)
 float yaw = 0;
@@ -272,11 +272,178 @@ void print_all_data(uint32_t t) {
   Serial.print(pose.y, 3);
   Serial.println("m");
 
+  // ★ 직진 주행 중일 때 헤딩 락 실시간 보정 상태 출력
+  if (pwmA > 0 && !isTurning) {
+    float hErr = targetHeading - yaw;
+    if (hErr > 180.0)
+      hErr -= 360.0;
+    if (hErr < -180.0)
+      hErr += 360.0;
+    Serial.print("  └─► [H-Lock] 목표: ");
+    Serial.print(targetHeading, 1);
+    Serial.print("° (오차: ");
+    Serial.print(hErr, 1);
+    Serial.print("°) | 좌측PWM(A): ");
+    Serial.print(pwmA);
+    Serial.print("  우측PWM(B): ");
+    Serial.println(pwmB);
+  }
+
   // ★ Nano(Serial2)로 좌표 데이터 전송 (YAW는 나노가 직접 계산하므로 제외)
   Serial2.print("POS:");
   Serial2.print(pose.x, 3);
   Serial2.print(",");
   Serial2.println(pose.y, 3);
+}
+
+// ── 경량 JSON 값 추출 함수 (키 기반 파싱) ─────────────────────
+String extractJsonValue(String json, String key) {
+  int keyIndex = json.indexOf("\"" + key + "\"");
+  if (keyIndex == -1) return "";
+
+  int colonIndex = json.indexOf(':', keyIndex);
+  if (colonIndex == -1) return "";
+
+  int startIdx = colonIndex + 1;
+  while (startIdx < (int)json.length() && (json[startIdx] == ' ' || json[startIdx] == '\t')) {
+    startIdx++;
+  }
+  if (startIdx >= (int)json.length()) return "";
+
+  if (json[startIdx] == '\"') {
+    startIdx++;
+    int endIdx = json.indexOf('\"', startIdx);
+    if (endIdx != -1) {
+      return json.substring(startIdx, endIdx);
+    }
+  } else {
+    int endIdx = startIdx;
+    while (endIdx < (int)json.length() && json[endIdx] != ',' && json[endIdx] != '}' && json[endIdx] != ' ' && json[endIdx] != '\r' && json[endIdx] != '\n') {
+      endIdx++;
+    }
+    return json.substring(startIdx, endIdx);
+  }
+  return "";
+}
+
+// ── 주행 및 부가 명령 통합 처리 함수 ───────────────────────────
+void processCommand(String cmd, uint32_t now) {
+  static int lastCommand = -9999;
+  static unsigned long lastCmdTime = 0;
+  const unsigned long CMD_COOLDOWN = 500;
+
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  // 1. JSON 형식인 경우: {"S-signal":"STOP", "R-signal":"RESET_ODO"}
+  if (cmd.startsWith("{") && cmd.endsWith("}")) {
+    String sSignal = extractJsonValue(cmd, "S-signal");
+    String rSignal = extractJsonValue(cmd, "R-signal");
+
+    Serial.print("[JSON 명령 수신] S-signal: '");
+    Serial.print(sSignal);
+    Serial.print("', R-signal: '");
+    Serial.print(rSignal);
+    Serial.println("'");
+
+    // R-signal 처리 (부가 명령어: RESET_ODO)
+    if (rSignal.equalsIgnoreCase("RESET_ODO")) {
+      lastRecvTime = now;
+      resetOdometry();
+      Serial.println("위치 초기화 완료 (0, 0)");
+      Serial2.println("POS:0.000,0.000,0.0");
+    }
+
+    // S-signal 처리 (주행/조향 명령)
+    if (sSignal.length() > 0) {
+      if (sSignal.equalsIgnoreCase("STOP") || sSignal == "-1") {
+        lastRecvTime = now;
+        currentBasePWM = 0;
+        STOP();
+        isTurning = false;
+        pwmA = pwmB = pwmC = pwmD = 0;
+        Serial.println("정지 명령(STOP) 수신 및 정지 완료");
+      } else if (sSignal == "0") {
+        lastRecvTime = now;
+        if (isTurning || pwmA == 0) {
+          initStraightMode();
+        }
+        isTurning = false;
+        ADVANCE();
+        Serial.println("직진 명령(0) 수신 및 직진 시작");
+      } else {
+        // 각도 회전 명령 (예: 90, -90 등)
+        int target = sSignal.toInt();
+        if (!(target == lastCommand && (now - lastCmdTime) < CMD_COOLDOWN)) {
+          lastCommand = target;
+          lastCmdTime = now;
+          lastRecvTime = now;
+          Serial.print("회전 각도 수신: ");
+          Serial.println(target);
+
+          STOP();
+          pwmA = pwmB = pwmC = pwmD = 0;
+          delay(100);
+          destinationAngle = yaw + target;
+          if (destinationAngle >= 360.0) destinationAngle -= 360.0;
+          if (destinationAngle < 0.0)   destinationAngle += 360.0;
+          isTurning = true;
+        }
+      }
+    }
+    return;
+  }
+
+  // 2. 단일 텍스트 명령 처리 (하위 호환)
+  if (cmd.equalsIgnoreCase("RESET_ODO")) {
+    lastRecvTime = now;
+    resetOdometry();
+    Serial.println("위치 초기화 완료 (0, 0)");
+    Serial2.println("POS:0.000,0.000,0.0");
+  } else if (cmd.equalsIgnoreCase("STOP") || cmd == "-1") {
+    lastRecvTime = now;
+    currentBasePWM = 0;
+    STOP();
+    isTurning = false;
+    pwmA = pwmB = pwmC = pwmD = 0;
+    Serial.println("정지 명령(STOP) 수신 및 정지 완료");
+  } else if (cmd == "0") {
+    lastRecvTime = now;
+    if (isTurning || pwmA == 0) {
+      initStraightMode();
+    }
+    isTurning = false;
+    ADVANCE();
+    Serial.println("직진 명령(0) 수신 및 직진 시작");
+  } else {
+    // 숫자 각도 검사
+    bool isValidNumber = true;
+    for (unsigned int i = 0; i < cmd.length(); i++) {
+      if (i == 0 && cmd[i] == '-') continue;
+      if (!isDigit(cmd[i])) {
+        isValidNumber = false;
+        break;
+      }
+    }
+    if (isValidNumber) {
+      int target = cmd.toInt();
+      if (!(target == lastCommand && (now - lastCmdTime) < CMD_COOLDOWN)) {
+        lastCommand = target;
+        lastCmdTime = now;
+        lastRecvTime = now;
+        Serial.print("회전 각도 수신: ");
+        Serial.println(target);
+
+        STOP();
+        pwmA = pwmB = pwmC = pwmD = 0;
+        delay(100);
+        destinationAngle = yaw + target;
+        if (destinationAngle >= 360.0) destinationAngle -= 360.0;
+        if (destinationAngle < 0.0)   destinationAngle += 360.0;
+        isTurning = true;
+      }
+    }
+  }
 }
 
 void setup() {
@@ -342,6 +509,7 @@ void loop() {
   }
 
   // ── PS2 컨트롤러 처리 ──────────────────────────────────
+  static bool wasPs2Advancing = false;
   bool ps2Controlled = false;
   if (ps2_error == 0 && ps2_type != 2) {
     ps2x.read_gamepad(false, vibrate);
@@ -358,68 +526,76 @@ void loop() {
       ps2Controlled = true;
       wasPs2Controlled = true;
       isTurning = false;
-      pwmA = 0;
-      pwmB = 0;
-      pwmC = 0;
-      pwmD = 0;
       lastRecvTime = now; // 워치독 방지
 
-      if (ps2x.Button(PSB_START)) {
+      // ── 직진 (헤딩 보정 및 PID 적용) ──
+      if (ps2x.Button(PSB_START) || ps2x.Button(PSB_PAD_UP) ||
+          ps2x.Button(PSB_GREEN)) {
         Motor_PWM = 125;
-        pwmA = pwmB = pwmC = pwmD = Motor_PWM;
+        if (!wasPs2Advancing || pwmA == 0) {
+          initStraightMode(); // 헤딩 락 기준 각도 캡처 및 PID 리셋
+          wasPs2Advancing = true;
+        }
         ADVANCE();
-      } else if (ps2x.Button(PSB_PAD_UP)) {
-        Motor_PWM = 125;
-        pwmA = pwmB = pwmC = pwmD = Motor_PWM;
-        ADVANCE();
-      } else if (ps2x.Button(PSB_PAD_DOWN)) {
+      } else if (ps2x.Button(PSB_PAD_DOWN) || ps2x.Button(PSB_BLUE)) {
+        wasPs2Advancing = false;
+        pwmA = 0;
         Motor_PWM = 125;
         BACK();
-      } else if (ps2x.Button(PSB_PAD_LEFT)) {
+      } else if (ps2x.Button(PSB_PAD_LEFT) || ps2x.Button(PSB_PINK)) {
+        wasPs2Advancing = false;
+        pwmA = 0;
         Motor_PWM = 125;
         TURN_LEFT();
-      } else if (ps2x.Button(PSB_PAD_RIGHT)) {
+      } else if (ps2x.Button(PSB_PAD_RIGHT) || ps2x.Button(PSB_RED)) {
+        wasPs2Advancing = false;
+        pwmA = 0;
         Motor_PWM = 125;
         TURN_RIGHT();
       } else if (ps2x.Button(PSB_SELECT)) {
+        wasPs2Advancing = false;
+        currentBasePWM = 0;
+        pwmA = pwmB = pwmC = pwmD = 0;
         STOP();
-      } else if (ps2x.Button(PSB_PINK)) {
-        Motor_PWM = 125;
-        TURN_LEFT();
-      } else if (ps2x.Button(PSB_RED)) {
-        Motor_PWM = 125;
-        TURN_RIGHT();
-      } else if (ps2x.Button(PSB_GREEN)) {
-        Motor_PWM = 125;
-        pwmA = pwmB = pwmC = pwmD = Motor_PWM;
-        ADVANCE();
-      } else if (ps2x.Button(PSB_BLUE)) {
-        Motor_PWM = 125;
-        BACK();
       } else if (ps2x.Button(PSB_L1) || ps2x.Button(PSB_R1)) {
         int LY = ps2x.Analog(PSS_LY);
         int LX = ps2x.Analog(PSS_LX);
 
-        if (LY < 127) {
+        if (LY < 127) { // 아날로그 전진 (헤딩 보정 적용)
           Motor_PWM = 1.5 * (127 - LY);
-          pwmA = pwmB = pwmC = pwmD = Motor_PWM;
+          if (!wasPs2Advancing || pwmA == 0) {
+            initStraightMode();
+            wasPs2Advancing = true;
+          }
           ADVANCE();
         } else if (LY > 127) {
+          wasPs2Advancing = false;
+          pwmA = 0;
           Motor_PWM = 1.5 * (LY - 128);
           BACK();
         } else if (LX < 128) {
+          wasPs2Advancing = false;
+          pwmA = 0;
           Motor_PWM = 1.5 * (127 - LX);
           TURN_LEFT();
         } else if (LX > 128) {
+          wasPs2Advancing = false;
+          pwmA = 0;
           Motor_PWM = 1.5 * (LX - 128);
           TURN_RIGHT();
         } else {
+          wasPs2Advancing = false;
+          currentBasePWM = 0;
+          pwmA = pwmB = pwmC = pwmD = 0;
           STOP();
         }
       }
       delay(20);
     } else {
       if (wasPs2Controlled) {
+        wasPs2Advancing = false;
+        currentBasePWM = 0;
+        pwmA = pwmB = pwmC = pwmD = 0;
         STOP();
         wasPs2Controlled = false;
       }
@@ -459,8 +635,8 @@ void loop() {
     speedD = (abs(cD) / 10.0) / dt;
     lastSpeedTime = now;
 
-    // 직진 주행 중일 때만 100ms 주기로 PID 연산 및 출력 반영
-    if (!ps2Controlled && !isTurning && pwmA > 0) {
+    // 직진 주행 중일 때 100ms 주기로 PID 연산 및 출력 반영 (자동/리모컨 공통)
+    if (!isTurning && pwmA > 0) {
       // ── 1. 가감속(Ramp) 점진적 속도 증가/감소 (목표: Motor_PWM) ──
       if (currentBasePWM < Motor_PWM) {
         currentBasePWM = min(currentBasePWM + RAMP_ACCEL_STEP, Motor_PWM);
@@ -476,17 +652,22 @@ void loop() {
         headingError += 360.0;
 
       // 헤딩 보정량 계산 (오차가 클 때 과도한 보정 방지를 위해 ±30.0으로 제한)
-      float headingCorrection = constrain(headingError * KP_HEADING, -30.0f, 30.0f);
+      float headingCorrection =
+          constrain(headingError * KP_HEADING, -30.0f, 30.0f);
 
       // 좌/우 바퀴의 목표 속도 차등 적용
       // (차체가 오른쪽으로 틀어지면 headingError < 0 -> 좌측 증속, 우측 감속)
-      float targetSpeedLeft  = (float)Motor_PWM - headingCorrection;
+      float targetSpeedLeft = (float)Motor_PWM - headingCorrection;
       float targetSpeedRight = (float)Motor_PWM + headingCorrection;
 
-      float corrA = constrain(pidA.compute(targetSpeedLeft,  speedA), -70.0, 70.0);
-      float corrB = constrain(pidB.compute(targetSpeedRight, speedB), -70.0, 70.0);
-      float corrC = constrain(pidC.compute(targetSpeedLeft,  speedC), -70.0, 70.0);
-      float corrD = constrain(pidD.compute(targetSpeedRight, speedD), -70.0, 70.0);
+      float corrA =
+          constrain(pidA.compute(targetSpeedLeft, speedA), -70.0, 70.0);
+      float corrB =
+          constrain(pidB.compute(targetSpeedRight, speedB), -70.0, 70.0);
+      float corrC =
+          constrain(pidC.compute(targetSpeedLeft, speedC), -70.0, 70.0);
+      float corrD =
+          constrain(pidD.compute(targetSpeedRight, speedD), -70.0, 70.0);
 
       pwmA = constrain(currentBasePWM + (int)corrA, 0, 255);
       pwmB = constrain(currentBasePWM + (int)corrB, 0, 255);
@@ -513,100 +694,46 @@ void loop() {
       }
     }
 
-    // ── PC/나노 명령 논블로킹(Non-blocking) 수신 ──
-    static String inputBuffer = "";
-    static int lastCommand = -9999;       // 마지막 처리한 명령값
-    static unsigned long lastCmdTime = 0; // 마지막 명령 처리 시간
-    const unsigned long CMD_COOLDOWN =
-        500; // 동일 명령 반복 처리 최소 간격 (ms)
-
+    // ── PC/나노 명령 논블로킹(Non-blocking) 수신 (Serial2: 나노, Serial: PC USB) ──
+    static String inputBuffer2 = "";
     while (isCalibrated && Serial2.available() > 0) {
       char c = Serial2.read();
       if (c == '\n') {
-        inputBuffer.trim();
-
-        if (inputBuffer.length() > 0) {
+        inputBuffer2.trim();
+        if (inputBuffer2.length() > 0) {
           // YAW 데이터 파싱 (나노로부터 공급받음)
-          if (inputBuffer.startsWith("YAW:")) {
-            float tempYaw = inputBuffer.substring(4).toFloat();
+          if (inputBuffer2.startsWith("YAW:")) {
+            float tempYaw = inputBuffer2.substring(4).toFloat();
             if (!isnan(tempYaw) && !isinf(tempYaw)) {
               yaw = tempYaw;
               lastRecvTime = now; // 워치독 타이머 갱신
             }
-          }
-          // 1. 비정상적으로 긴 데이터 필터링 (최대 10자 제한 - 노이즈 방지)
-          else if (inputBuffer.length() > 10) {
-            Serial.println("[경고] 비정상적인 길이의 명령 무시 (노이즈)");
-          }
-          // ★ "RESET_ODO" 명령 추가 — 위치를 (0,0)으로 리셋
-          else if (inputBuffer == "RESET_ODO") {
-            lastRecvTime = now; // 워치독 리셋
-            resetOdometry();
-            Serial.println("위치 초기화 완료 (0, 0)");
-            Serial2.println("POS:0.000,0.000,0.0"); // 초기화 즉시 나노에 전송
           } else {
-            lastRecvTime = now; // 워치독 리셋
-
-            // 유효성 검사: 수신된 문자열이 유효한 숫자인지 확인 (노이즈 방지)
-            bool isValidNumber = true;
-            for (unsigned int i = 0; i < inputBuffer.length(); i++) {
-              if (i == 0 && inputBuffer[i] == '-')
-                continue; // 음수 기호 허용
-              if (!isDigit(inputBuffer[i])) {
-                isValidNumber = false;
-                break;
-              }
-            }
-
-            if (!isValidNumber) {
-              static unsigned long lastNoiseLog = 0;
-              if (now - lastNoiseLog >= 2000) {
-                lastNoiseLog = now;
-                Serial.print("유효하지 않은 명령 무시 (노이즈): ");
-                Serial.println(inputBuffer);
-              }
-            } else {
-              int target = inputBuffer.toInt();
-
-              // 동일 명령 연속 수신 방지
-              if (!(target == lastCommand &&
-                    (now - lastCmdTime) < CMD_COOLDOWN)) {
-                lastCommand = target;
-                lastCmdTime = now;
-
-                Serial.print("명령 각도 수신: ");
-                Serial.println(target);
-
-                if (target == -1) {
-                  currentBasePWM = 0;
-                  STOP();
-                  isTurning = false;
-                  pwmA = pwmB = pwmC = pwmD = 0;
-                } else if (target == 0) {
-                  if (isTurning || pwmA == 0) {
-                    initStraightMode();
-                  }
-                  isTurning = false;
-                  ADVANCE();
-                } else {
-                  STOP();
-                  pwmA = pwmB = pwmC = pwmD = 0;
-                  delay(100);
-                  destinationAngle = yaw + target;
-                  if (destinationAngle >= 360.0)
-                    destinationAngle -= 360.0;
-                  if (destinationAngle < 0.0)
-                    destinationAngle += 360.0;
-                  isTurning = true;
-                }
-              }
-            }
+            processCommand(inputBuffer2, now);
           }
         }
-        inputBuffer = ""; // 1줄 처리 완료 후 버퍼 비우기
+        inputBuffer2 = "";
       } else if (c != '\r') {
-        inputBuffer += c;
-        if (inputBuffer.length() > 30) inputBuffer = ""; // 노이즈 오버플로우 방어
+        inputBuffer2 += c;
+        if (inputBuffer2.length() > 100)
+          inputBuffer2 = "";
+      }
+    }
+
+    // PC USB 시리얼(Serial) 직접 입력 수신
+    static String inputBuffer1 = "";
+    while (Serial.available() > 0) {
+      char c = Serial.read();
+      if (c == '\n') {
+        inputBuffer1.trim();
+        if (inputBuffer1.length() > 0) {
+          processCommand(inputBuffer1, now);
+        }
+        inputBuffer1 = "";
+      } else if (c != '\r') {
+        inputBuffer1 += c;
+        if (inputBuffer1.length() > 100)
+          inputBuffer1 = "";
       }
     }
     // 제자리 회전 시퀀스 (오차 비례 부드러운 감속 회전)
@@ -625,7 +752,8 @@ void loop() {
         ADVANCE();
         Serial.println("직진 시작");
       } else {
-        // 남은 오차(2도 ~ 45도)에 따라 회전 PWM을 60 ~ Motor_PWM 사이로 비례 감속
+        // 남은 오차(2도 ~ 45도)에 따라 회전 PWM을 60 ~ Motor_PWM 사이로 비례
+        // 감속
         int turnPwm = constrain((int)(abs(error) * 2.0f + 55), 60, Motor_PWM);
 
         if (error > 0)

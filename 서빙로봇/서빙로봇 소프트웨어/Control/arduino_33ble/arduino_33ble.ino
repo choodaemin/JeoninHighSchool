@@ -1,6 +1,6 @@
+#include "MPU9250.h"
 #include <ArduinoBLE.h>
 #include <Wire.h>
-#include "MPU9250.h"
 
 MPU9250 mpu;
 float roll = 0, pitch = 0, yaw = 0;
@@ -23,7 +23,7 @@ float pre_ch1, pre_ch2;
 float ch1, ch2;
 
 unsigned long lastSensorTime = 0;
-const unsigned long sensorInterval = 1000;
+const unsigned long sensorInterval = 100; // 100ms (10Hz) 고속 측정 주기로 개선
 
 bool bleAvailable = false;
 
@@ -34,7 +34,8 @@ float robotYaw = 0.0;
 
 // BLE 설정
 BLEService myService("12345678-1234-1234-1234-1234567890ab");
-BLEStringCharacteristic myChar("abcdefab-1234-5678-1234-abcdefabcdef", BLERead | BLEWrite | BLENotify, 100);
+BLEStringCharacteristic myChar("abcdefab-1234-5678-1234-abcdefabcdef",
+                               BLERead | BLEWrite | BLENotify, 100);
 
 // 센서 상태 머신
 enum SensorState {
@@ -95,51 +96,46 @@ bool updateSensor(UltrasonicSensor &sensor) {
   unsigned long now = micros();
 
   switch (sensor.state) {
-    case SENSOR_IDLE:
+  case SENSOR_IDLE:
+    return true;
+
+  case SENSOR_TRIG_HIGH:
+    if (now - sensor.trigStartTime >= 2) {
+      digitalWrite(sensor.trigPin, HIGH);
+      sensor.trigStartTime = now;
+      sensor.state = SENSOR_WAIT_ECHO;
+    }
+    return false;
+
+  case SENSOR_WAIT_ECHO:
+    if (now - sensor.trigStartTime >= 10) {
+      digitalWrite(sensor.trigPin, LOW);
+      sensor.timeoutStart = now;
+      sensor.state = SENSOR_MEASURING;
+    }
+    return false;
+
+  case SENSOR_MEASURING:
+    if (sensor.echoReceived) {
+      unsigned long duration = sensor.echoEnd - sensor.echoStart;
+      sensor.distance = duration * 0.034 / 2.0;
+      sensor.state = SENSOR_DONE;
       return true;
-
-    case SENSOR_TRIG_HIGH:
-      if (now - sensor.trigStartTime >= 2) {
-        digitalWrite(sensor.trigPin, HIGH);
-        sensor.trigStartTime = now;
-        sensor.state = SENSOR_WAIT_ECHO;
-      }
-      return false;
-
-    case SENSOR_WAIT_ECHO:
-      if (now - sensor.trigStartTime >= 10) {
-        digitalWrite(sensor.trigPin, LOW);
-        sensor.timeoutStart = now;
-        sensor.state = SENSOR_MEASURING;
-      }
-      return false;
-
-    case SENSOR_MEASURING:
-      if (sensor.echoReceived) {
-        unsigned long duration = sensor.echoEnd - sensor.echoStart;
-        sensor.distance = duration * 0.034 / 2.0;
-        sensor.state = SENSOR_DONE;
-        return true;
-      }
-      if (now - sensor.timeoutStart > 20000) {
-        sensor.distance = -1;
-        sensor.state = SENSOR_DONE;
-        return true;
-      }
-      return false;
-
-    case SENSOR_DONE:
+    }
+    if (now - sensor.timeoutStart > 20000) {
+      sensor.distance = -1;
+      sensor.state = SENSOR_DONE;
       return true;
+    }
+    return false;
+
+  case SENSOR_DONE:
+    return true;
   }
   return true;
 }
 
-enum MeasurePhase {
-  PHASE_IDLE,
-  PHASE_SENSOR1,
-  PHASE_SENSOR2,
-  PHASE_COMPLETE
-};
+enum MeasurePhase { PHASE_IDLE, PHASE_SENSOR1, PHASE_SENSOR2, PHASE_COMPLETE };
 
 MeasurePhase measurePhase = PHASE_IDLE;
 
@@ -152,25 +148,25 @@ void requestMeasurement() {
 
 bool updateMeasurement() {
   switch (measurePhase) {
-    case PHASE_IDLE:
-      return false;
+  case PHASE_IDLE:
+    return false;
 
-    case PHASE_SENSOR1:
-      if (updateSensor(sensor1)) {
-        measurePhase = PHASE_SENSOR2;
-        startMeasurement(sensor2);
-      }
-      return false;
+  case PHASE_SENSOR1:
+    if (updateSensor(sensor1)) {
+      measurePhase = PHASE_SENSOR2;
+      startMeasurement(sensor2);
+    }
+    return false;
 
-    case PHASE_SENSOR2:
-      if (updateSensor(sensor2)) {
-        measurePhase = PHASE_COMPLETE;
-        return true;
-      }
-      return false;
-
-    case PHASE_COMPLETE:
+  case PHASE_SENSOR2:
+    if (updateSensor(sensor2)) {
+      measurePhase = PHASE_COMPLETE;
       return true;
+    }
+    return false;
+
+  case PHASE_COMPLETE:
+    return true;
   }
   return false;
 }
@@ -181,15 +177,15 @@ void finishMeasurement() {
   sensor2.state = SENSOR_IDLE;
 }
 
-void handleCommand(String command) {
-  Serial1.println(command);
-}
+void handleCommand(String command) { Serial1.println(command); }
 
 void sendCombinedData() {
   if (bleAvailable) {
     BLEDevice central = BLE.central();
     if (central && central.connected()) {
-      String msg = String(robotX, 3) + "," + String(robotY, 3) + "," + String(yaw, 1) + "," + String(ch1, 1) + "," + String(ch2, 1) + "\n";
+      String msg = String(robotX, 3) + "," + String(robotY, 3) + "," +
+                   String(yaw, 1) + "," + String(ch1, 1) + "," +
+                   String(ch2, 1) + "\n";
       myChar.writeValue(msg);
     }
   }
@@ -211,8 +207,8 @@ void readMegaSerial() {
             float tempX = inputBuffer.substring(4, comma1).toFloat();
             float tempY = inputBuffer.substring(comma1 + 1).toFloat();
 
-            if (!isnan(tempX) && !isinf(tempX) &&
-                !isnan(tempY) && !isinf(tempY)) {
+            if (!isnan(tempX) && !isinf(tempX) && !isnan(tempY) &&
+                !isinf(tempY)) {
               robotX = tempX;
               robotY = tempY;
               sendCombinedData();
@@ -229,17 +225,13 @@ void readMegaSerial() {
 
 // ── BLE 수신 명령 처리 ────────────────────────────────
 void handleBLECommand() {
-  if (!myChar.written()) return;
+  if (!myChar.written())
+    return;
 
   String command = myChar.value();
   command.trim();
-
-  // 콤마 포함(결합 데이터) 필터링
-  if (command.indexOf(',') != -1) return;
-
-  // 유효 범위 필터링 (-90 ~ 90)
-  int val = command.toInt();
-  if (command.length() == 0 || val < -90 || val > 90) return;
+  if (command.length() == 0)
+    return;
 
   Serial.print("BLE 수신 데이터: ");
   Serial.println(command);
@@ -250,21 +242,22 @@ void updateIMUAndSend() {
   unsigned long now = millis();
   if (now - lastImuTime >= IMU_INTERVAL) {
     lastImuTime = now;
-    if (mpu.update()) { 
-      float dt = (now - last_ms) / 1000.0; 
+    if (mpu.update()) {
+      float dt = (now - last_ms) / 1000.0;
       last_ms = now;
 
-      float ax = mpu.getAccX(); 
-      float ay = mpu.getAccY(); 
+      float ax = mpu.getAccX();
+      float ay = mpu.getAccY();
       float az = mpu.getAccZ();
-      float acc_roll  = atan2(ay, az) * RAD_TO_DEG;
-      float acc_pitch = atan2(-ax, sqrt(ay*ay + az*az)) * RAD_TO_DEG;
-      roll  = alpha * (roll  + mpu.getGyroX() * dt) + (1.0 - alpha) * acc_roll;
+      float acc_roll = atan2(ay, az) * RAD_TO_DEG;
+      float acc_pitch = atan2(-ax, sqrt(ay * ay + az * az)) * RAD_TO_DEG;
+      roll = alpha * (roll + mpu.getGyroX() * dt) + (1.0 - alpha) * acc_roll;
       pitch = alpha * (pitch + mpu.getGyroY() * dt) + (1.0 - alpha) * acc_pitch;
-      
+
       static float lastValidGz = 0.0;
-      float gz = mpu.getGyroZ() - gyroZ_offset; 
-      if (abs(gz) < deadzone) gz = 0;
+      float gz = mpu.getGyroZ() - gyroZ_offset;
+      if (abs(gz) < deadzone)
+        gz = 0;
 
       if (isnan(gz) || isinf(gz) || abs(gz) > 500.0) {
         gz = lastValidGz;
@@ -275,8 +268,10 @@ void updateIMUAndSend() {
       float next_yaw = yaw - gz * dt;
       if (!isnan(next_yaw) && !isinf(next_yaw)) {
         yaw = next_yaw;
-        while (yaw < 0.0)    yaw += 360.0;
-        while (yaw >= 360.0) yaw -= 360.0;
+        while (yaw < 0.0)
+          yaw += 360.0;
+        while (yaw >= 360.0)
+          yaw -= 360.0;
       }
 
       // 메가로 실시간 각도 전송 (115200bps이므로 오버헤드 미미)
@@ -298,14 +293,16 @@ void setup() {
   Serial.begin(9600);
   Serial1.begin(115200); // 메가와 고속 통신 설정
 
-  // ★ 나노 33 BLE는 네이티브 USB라 부팅이 아주 빨라서 시리얼 모니터를 켜기 전에 setup()이 끝나버립니다.
-  // 시리얼 모니터가 연결될 때까지 최대 3초간 기다려주는 코드를 추가합니다.
+  // ★ 나노 33 BLE는 네이티브 USB라 부팅이 아주 빨라서 시리얼 모니터를 켜기 전에
+  // setup()이 끝나버립니다. 시리얼 모니터가 연결될 때까지 최대 3초간 기다려주는
+  // 코드를 추가합니다.
   unsigned long startWait = millis();
-  while (!Serial && (millis() - startWait < 3000));
+  while (!Serial && (millis() - startWait < 3000))
+    ;
   delay(500);
 
   Wire.begin();
-  Wire.setClock(50000); 
+  Wire.setClock(50000);
 
   // ★ I2C 스캐너 기능 추가: 연결된 모든 I2C 장치 주소 찾기
   Serial.println("--- I2C 장치 스캔 시작 ---");
@@ -318,11 +315,14 @@ void setup() {
       Serial.println(addr, HEX);
       i2cCount++;
     } else if (error == 4) {
-      Serial.print("-> 주소 0x"); Serial.print(addr, HEX); Serial.println("에서 에러 4 발생");
+      Serial.print("-> 주소 0x");
+      Serial.print(addr, HEX);
+      Serial.println("에서 에러 4 발생");
     }
   }
   if (i2cCount == 0) {
-    Serial.println("[경고] 발견된 I2C 장치가 없습니다! (배선, GND 공통 연결, SDA/SCL 확인 필요)");
+    Serial.println("[경고] 발견된 I2C 장치가 없습니다! (배선, GND 공통 연결, "
+                   "SDA/SCL 확인 필요)");
   }
   Serial.println("--------------------------");
 
@@ -338,7 +338,7 @@ void setup() {
   } else {
     Serial.println("MPU9250 연결 성공! 칼리브레이션 시작...");
     mpu.calibrateAccelGyro();
-    
+
     float sum = 0;
     int validSamples = 0;
     unsigned long startCalib = millis();
@@ -391,8 +391,8 @@ void setup() {
     myService.addCharacteristic(myChar);
     BLE.addService(myService);
 
-    myChar.writeValue("");  // 초기값 클리어
-    myChar.written();       // written() 플래그 소모
+    myChar.writeValue(""); // 초기값 클리어
+    myChar.written();      // written() 플래그 소모
 
     BLE.advertise();
     Serial.println("PC 연결 대기 중...");
@@ -429,7 +429,7 @@ void loop() {
 
       while (central.connected()) {
         BLE.poll();
-        //Serial.println("------------------");
+        // Serial.println("------------------");
         if (Serial && Serial.available() > 0) {
           String command = Serial.readStringUntil('\n');
           command.trim();
@@ -441,11 +441,13 @@ void loop() {
         }
 
         readMegaSerial();
-        updateIMUAndSend(); // BLE 기기가 연결되어 작동할 때도 계속 YAW를 메가에 전송
+        updateIMUAndSend(); // BLE 기기가 연결되어 작동할 때도 계속 YAW를 메가에
+                            // 전송
 
         unsigned long currentMillis = millis();
 
-        if (measurePhase == PHASE_IDLE && currentMillis - lastSensorTime >= sensorInterval) {
+        if (measurePhase == PHASE_IDLE &&
+            currentMillis - lastSensorTime >= sensorInterval) {
           lastSensorTime = currentMillis;
           pre_ch1 = ch1;
           pre_ch2 = ch2;
@@ -455,12 +457,12 @@ void loop() {
         if (updateMeasurement()) {
           ch1 = sensor1.distance;
           ch2 = sensor2.distance;
-          //Serial.println(ch2);
+          // Serial.println(ch2);
           sendCombinedData();
           finishMeasurement();
         }
 
-        handleBLECommand();  // ← 별도 함수로 분리 및 필터링 적용
+        handleBLECommand(); // ← 별도 함수로 분리 및 필터링 적용
       }
 
       // 연결 종료 시 플래그 클리어
