@@ -47,10 +47,9 @@ def main(use_mock: bool = False, visualize: bool = True):
 
     # ── [자동 맵 불러오기] 이전에 저장된 맵 파일이 있으면 시작 시 자동 복원 ──
     status_msg = "SYSTEM READY"
-    if os.path.exists("saved_map.npz"):
-        if occ_map.load_map("saved_map.npz"):
-            status_msg = "PREVIOUS MAP AUTO-LOADED"
-            print("[System] 📂 이전 세션 맵(saved_map.npz) 자동 불러오기 완료!")
+    if occ_map.load_map("saved_map.npz"):
+        status_msg = "PREVIOUS MAP AUTO-LOADED"
+        print("[System] 📂 이전 세션 맵(saved_map.npz) 자동 불러오기 완료!")
 
     lidar_proc = LidarProcessor(use_mock=use_mock)
     lidar_proc.start()
@@ -58,10 +57,12 @@ def main(use_mock: bool = False, visualize: bool = True):
     oak_proc: Optional[OakProcessor] = None
     if not use_mock:
         try:
-            oak_proc = OakProcessor()
-            oak_proc.start()
+            temp_oak = OakProcessor()
+            temp_oak.start()
+            oak_proc = temp_oak
             print("[System] OAK-D-Lite Camera Initialized.")
         except Exception as e:
+            oak_proc = None
             print(f"[System] OAK-D-Lite Init Failed: {e} -> LiDAR Single Mode")
 
     # ── 2. UI 및 상태 변수 초기화 ────────────────────────────────────
@@ -300,11 +301,12 @@ def main(use_mock: bool = False, visualize: bool = True):
 
                 # waitKey 호출 이후 OpenCV Window 닫기(X 버튼 클릭) 감지
                 try:
-                    if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                    prop = cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE)
+                    if prop == 0 and frame_count > 5:
                         print("[System] GUI 창 닫기(X) 감지 -> 종료 중...")
                         break
                 except Exception:
-                    break
+                    pass
 
                 if key == ord('q') or key == 27:  # 'q' 또는 ESC
                     print("[System] 종료 키 입력 -> 종료 중...")
@@ -346,6 +348,10 @@ def main(use_mock: bool = False, visualize: bool = True):
 
     except KeyboardInterrupt:
         print("\n[System] 사용자 중지 요청 (Ctrl+C)")
+    except Exception as e:
+        print(f"\n[System] ⚠️ 메인 루프 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         print("\n[System] 시스템 정리 및 자원 해제 중...")

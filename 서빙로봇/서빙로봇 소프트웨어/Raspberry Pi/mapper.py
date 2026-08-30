@@ -317,8 +317,17 @@ class OccupancyMap:
         return width_m, length_m, nearest_m
 
     # ── 맵 저장 및 불러오기 (File I/O) ──────────────────────────────
+    def _resolve_path(self, filepath: str) -> str:
+        """상대 경로 입력 시 mapper.py가 위치한 폴더 기준으로 절대 경로 변환"""
+        import os
+        if not os.path.isabs(filepath):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            return os.path.join(base_dir, filepath)
+        return filepath
+
     def save_map(self, filepath: str = "saved_map.npz") -> bool:
         """현재 점유 격자 맵을 압축 파일(.npz)과 시각화 이미지(.png)로 동시 저장"""
+        filepath = self._resolve_path(filepath)
         try:
             np.savez_compressed(
                 filepath,
@@ -350,6 +359,7 @@ class OccupancyMap:
     def load_map(self, filepath: str = "saved_map.npz") -> bool:
         """저장된 .npz 맵 파일을 불러와 현재 맵 및 static_grid로 복원"""
         import os
+        filepath = self._resolve_path(filepath)
         if not os.path.exists(filepath):
             print(f"[OccupancyMap] ⚠️ 저장된 맵 파일이 존재하지 않습니다: {filepath}")
             return False

@@ -1,19 +1,38 @@
 """
 path_recommender.py
-하이브리드 7방향 경로 추천 및 BLE 회피 제어 모듈
+서빙 로봇 19방향 하이브리드 경로 추천 & 7단계 ㄷ자 장애물 회피 시스템
 
-동작 로직:
-  1. 7방향의 스코어링(50x50cm 풋프린트 반영) 분석 결과를 실시간으로 시각화 대시보드에 제공합니다.
-  2. 웬만한 상태(평상시)에서는 무조건 직진(best_angle_deg = 0.0)을 유지하며 BLE로 "0"을 송신합니다.
-  3. 전방 50cm 이내에 장애물 감지 시 즉시 정지 상태로 천이하며 BLE로 "-1"을 전송합니다.
-  4. 정지 상태에서 아두이노로부터 초음파 센서 거리(RIGHT, LEFT) 값을 받아오고, 
-     이를 맵핑 데이터(격자 지도 상의 좌/우 clearance)와 복합 계산하여 최적의 회피 방향(오른쪽 90 또는 왼쪽 -90)을 정합니다.
-  5. 회피 상태(TURNING)에서 일정 프레임(8프레임) 회피 주행 신호를 송신한 뒤 전방이 확보되면 다시 직진으로 복귀합니다.
+핵심 아키텍처 및 동작 로직:
+  1. [19방향 레이마칭 & 50x50cm 풋프린트 스코어링]
+     - 로봇 정면 기준 10도 간격(-90° ~ +90°) 19개 방향으로 로봇 차체(50cm x 50cm)의 안전 여유 거리를 레이마칭 측정.
+     - 목표 좌표(Target X, Y) 지향성 가중치 및 직진 보너스를 복합 스코어링하여 최적 경로를 추천.
+
+  2. [목표 지향 2단계 순차 자율주행 (X축 정렬 -> Y축 정렬)]
+     - 시작 위치 원점 기준 상대 좌표 추적 및 10cm 이내 도달 시 정지 및 목표 도착(GOAL_REACHED) 처리.
+
+  3. [7단계 ㄷ자형 완전 회피 & 원래 레인 복귀 상태 머신]
+     - 0단계 (AVOID_BRAKE)       : 전방 장애물(30cm) 감지 시 관성 제동 및 완전 정지
+     - 1단계 (AVOID_TURN_90)      : 더 넓게 트인 측면으로 직각 90도 회전
+     - 2단계 (AVOID_PASS_WIDTH)   : 실측 장애물 폭에 맞춘 가로 직진 & 측면 초음파 감시
+     - 3단계 (AVOID_TURN_FRONT)   : 원래 진행 방향으로 정렬 회전
+     - 4단계 (AVOID_PASS_LENGTH)  : 실측 장애물 길이에 맞춘 세로 추월 직진 (초음파 이탈 감지)
+     - 5단계 (AVOID_TURN_RETURN)  : 원래 주행 레인으로 복귀 선회
+     - 6단계 (AVOID_PASS_RETURN)  : 비껴간 가로 거리만큼 복귀 직진
+     - 7단계 (AVOID_TURN_FINAL)   : 최종 진행 방향 정렬 후 정상 주행 재개
+
+  4. [다중 센서 융합 & 에러 세이프가드]
+     - 라이다(LiDAR) + 뎁스 카메라(OAK-D) + 좌/우 초음파 센서 융합
+     - 초음파 센서 -1/에러 값 수신 시 999.0cm(안전)로 자동 변환 및 3개 중간값(Median) 노이즈 필터링
+
+  5. [BLE JSON 제어 프로토콜 & 400ms 중복 방지]
+     - 패킷 규격: {"S-signal": "...", "R-signal": "..."}
+     - 정지: {"S-signal": "STOP", "R-signal": ""} / 리셋: {"S-signal": "STOP", "R-signal": "RESET_ODO"}
 """
 
 import math
 import re
 import json
+import time
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 from mapper import OccupancyMap, CELL_WALL, CELL_OBSTACLE
@@ -185,12 +204,9 @@ class PathRecommender:
         print(f"\n[PathRecommender] [ALIGN] 헤딩 0°/360° 정렬 시작! (현재 헤딩: {self.robot_heading_deg:.1f}°)")
 
     def start_navigation(self, x_m: float, y_m: float, name: str = "Goal"):
-        """'주행 시작': 현재 로봇 위치를 원점(전방=+X, 좌측=+Y, 우측=-Y)으로 정렬하고 목표 주행 개시"""
+        """'주행 시작': 목표 좌표(글로벌 절대 좌표계)로 주행 개시"""
         self._poll_ble()
         self.aligning_heading = False
-        self.origin_x = self.robot_x
-        self.origin_y = self.robot_y
-        self.origin_heading = self.robot_heading_deg
         self.avoid_state = "IDLE"
         self.avoid_target_head = None
         self.avoid_forward_timer = 0
@@ -200,7 +216,7 @@ class PathRecommender:
         self.target_name = name
         self.state = "FORWARD"
         self.sub_stage = "ALIGN_X"  # 1단계 X축 정렬 -> 2단계 Y축 정렬 순차 주행
-        print(f"\n[PathRecommender] [START] 주행 시작! 목표 좌표: ({x_m:.2f}, {y_m:.2f}) [전방=+X, 좌측=+Y, 우측=-Y] (1단계 X축 정렬 시작)")
+        print(f"\n[PathRecommender] [START] 주행 시작! 목표 좌표: ({x_m:.2f}, {y_m:.2f}) [전방=+X, 좌측=+Y, 우측=-Y] (현재 로봇: ({self.robot_x:.2f}, {self.robot_y:.2f}))")
 
     def _send_stop_packet(self, reset_odo: bool = False):
         """
@@ -208,11 +224,7 @@ class PathRecommender:
         - 평상시 (구동 전 / 대기 / 정지): {"S-signal": "STOP", "R-signal": ""}
         - 좌표 초기화 버튼 클릭 시: {"S-signal": "STOP", "R-signal": "RESET_ODO"}
         """
-        payload = {
-            "S-signal": "STOP",
-            "R-signal": "RESET_ODO" if reset_odo else ""
-        }
-        self._send_ble(json.dumps(payload))
+        self._send_ble("STOP", "RESET_ODO" if reset_odo else "", force=True)
 
     def stop_navigation(self):
         """'주행 정지': 즉시 주행을 취소하고 정지 신호 {"S-signal":"STOP", "R-signal":""} 전송 및 STOPPED 상태 전환"""
@@ -261,26 +273,23 @@ class PathRecommender:
 
     def _compute_goal_vector(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
-        주행 시작 시점 원점 기준 상대 위치에서 목표 (target_x, target_y)까지의
+        글로벌 절대 좌표계 기준 로봇 현재 위치에서 목표 (target_x, target_y)까지의
         (남은거리m, 로봇 상대 목표 각도deg, 목표 절대 각도deg) 계산.
         축 정의: 전방=+X(0도), 좌측=+Y(-90도), 우측=-Y(+90도), 후방=-X(180도)
         """
         if self.target_x is None or self.target_y is None:
             return None, None, None
 
-        # 원점 기준 상대 현재 위치 (전방=+X, 좌측=+Y, 우측=-Y)
-        rel_x = self.robot_x - self.origin_x
-        rel_y = self.robot_y - self.origin_y
-
-        dx = self.target_x - rel_x
-        dy = self.target_y - rel_y
+        # 글로벌 절대 좌표 기준 목표와의 오차 벡터 (전방=+X, 좌측=+Y, 우측=-Y)
+        dx = self.target_x - self.robot_x
+        dy = self.target_y - self.robot_y
         dist_m = math.hypot(dx, dy)
 
         # dx:전방(+X), dy:좌측(+Y)/우측(-Y) -> atan2(-dy, dx) => 전방=0도, 우측=+90도, 좌측=-90도, 후방=180도
         goal_global_deg = math.degrees(math.atan2(-dy, dx))
 
-        # 로봇 헤딩 차이 보정
-        rel_angle_deg = goal_global_deg - (self.robot_heading_deg - self.origin_heading)
+        # 로봇 헤딩 차이 보정 (0도 기준)
+        rel_angle_deg = goal_global_deg - self.robot_heading_deg
         rel_angle_deg = (rel_angle_deg + 180.0) % 360.0 - 180.0
 
         return dist_m, rel_angle_deg, goal_global_deg
@@ -422,9 +431,17 @@ class PathRecommender:
             print(f"[PathRecommender] BLE 파싱 예외 발생 ({latest}): {e}")
 
     def _update_ultrasonic(self, raw_right: float, raw_left: float):
-        """초음파 노이즈 필터링 (최근 3개 값의 중간값 필터)"""
-        self.ble_right_history.append(raw_right)
-        self.ble_left_history.append(raw_left)
+        """
+        초음파 노이즈 및 고장 에러(-1) 필터링
+        - -1 또는 0 이하(측정 실패/타임아웃): 장애물 없음(999.0cm)으로 안전 처리하여 오작동 방지
+        - 최근 3개 값의 중간값(Median) 필터로 튀는 노이즈 제거
+        """
+        # 에러 값(-1, <=0) 또는 비정상 큰 값(>400cm) 필터링
+        valid_r = raw_right if (raw_right > 0.0 and raw_right < 400.0) else 999.0
+        valid_l = raw_left if (raw_left > 0.0 and raw_left < 400.0) else 999.0
+
+        self.ble_right_history.append(valid_r)
+        self.ble_left_history.append(valid_l)
         if len(self.ble_right_history) > 3:
             self.ble_right_history.pop(0)
         if len(self.ble_left_history) > 3:
@@ -589,10 +606,8 @@ class PathRecommender:
         # ── 1. FORWARD 상태 ──
         if self.state == "FORWARD":
             if has_goal:
-                rel_x = self.robot_x - self.origin_x
-                rel_y = self.robot_y - self.origin_y
-                dx = self.target_x - rel_x
-                dy = self.target_y - rel_y
+                dx = self.target_x - self.robot_x
+                dy = self.target_y - self.robot_y
 
                 # 최종 도착 체크 (X, Y 종합 거리 오차 0.10m 이내)
                 dist_to_goal = math.hypot(dx, dy)
@@ -1014,23 +1029,25 @@ class PathRecommender:
                     )
 
                 # ─────────────────────────────────────────────────────────
-                # [직진 전진 상태] 턴이 완료되어 직진할 때만 장애물 감지 시 디귿자형 회피 시작!
+                # [직진 전진 상태] 턴이 완료되어 직진할 때 전방 장애물이 있는 경우에만 턴 방향 검사 및 회피!
                 # ─────────────────────────────────────────────────────────
                 if front_clearance < self.FRONT_STOP_DIST_M:
-                    # 초음파 센서 값이 더 큰 쪽(더 넓게 트인 쪽)으로 회피 방향 결정
-                    if abs(self.ble_right_cm - self.ble_left_cm) >= 5.0:
+                    # 턴하려는 방향(우측 vs 좌측)에 장애물/벽이 있는지 확인하여 더 넓게 트인 쪽으로 턴!
+                    # 초음파 거리(cm) 및 라이다 측면 여유 거리(m) 종합 비교
+                    right_scores = [s for s in scores if s.angle_deg > 0]
+                    left_scores  = [s for s in scores if s.angle_deg < 0]
+                    right_lidar_clearance = max([s.clearance_m for s in right_scores], default=0.0)
+                    left_lidar_clearance  = max([s.clearance_m for s in left_scores], default=0.0)
+
+                    # 초음파 센서 차이가 뚜렷하면 초음파 우선, 비슷하면 라이다 공간 기준 판정
+                    if abs(self.ble_right_cm - self.ble_left_cm) >= 10.0:
                         prefer_right = self.ble_right_cm > self.ble_left_cm
                     else:
-                        # 초음파 센서 값이 거의 대등할 때만 라이다 여유 공간 비교
-                        right_scores = [s for s in scores if s.angle_deg > 0]
-                        left_scores  = [s for s in scores if s.angle_deg < 0]
-                        right_lidar_clearance = max([s.clearance_m for s in right_scores], default=0.0)
-                        left_lidar_clearance  = max([s.clearance_m for s in left_scores], default=0.0)
                         prefer_right = right_lidar_clearance >= left_lidar_clearance
 
                     self.avoid_side = "RIGHT" if prefer_right else "LEFT"
 
-                    # [개선 1: 진행 방향 기준 상대적 90도 회피각 계산]
+                    # 진행 방향 기준 상대적 90도 회피각 계산
                     self.avoid_base_head = target_head
                     rel_turn_deg = 90.0 if prefer_right else -90.0
                     self.avoid_target_head = (self.avoid_base_head + rel_turn_deg + 180.0) % 360.0 - 180.0
@@ -1040,7 +1057,7 @@ class PathRecommender:
                     self.avoid_clear_count = 0
                     self.avoid_step_timeout = 100
 
-                    # [장애물 크기 측정 및 동적 회피 거리 계산]
+                    # 장애물 크기 측정 및 동적 회피 거리 계산
                     obs_w, obs_l, _ = self.occ_map.get_front_obstacle_dimensions(max_dist_m=1.2, half_width_m=0.8)
                     self.obs_measured_w = obs_w
                     self.obs_measured_l = obs_l
@@ -1050,7 +1067,7 @@ class PathRecommender:
                     # 동적 세로 추월 거리 = 장애물길이 + 로봇전장(0.50m) + 안전여유(0.15m)
                     self.target_avoid_length_m = max(self.MIN_AVOID_LENGTH_M, min(self.MAX_AVOID_LENGTH_M, obs_l + (self.ROBOT_HALF_M * 2.0) + 0.15))
 
-                    # [개선 2: 긴급 제동(Emergency Brake) 우선 적용 - 잔여 관성 제거]
+                    # 긴급 제동(Emergency Brake) 우선 적용
                     self.avoid_state = "AVOID_BRAKE"
                     self.avoid_brake_timer = 3
                     self._send_stop_packet(reset_odo=False)
@@ -1058,7 +1075,7 @@ class PathRecommender:
                     return PathRecommendation(
                         best_angle_deg=self.STOP_ANGLE,
                         best_label="Stop",
-                        reason=f"전방 장애물(폭:{obs_w:.2f}m, 깊이:{obs_l:.2f}m) 감지 -> 제동 후 {self.avoid_side} 90도 회피 (목표가로:{self.target_avoid_width_m:.2f}m, 세로:{self.target_avoid_length_m:.2f}m)",
+                        reason=f"전방 장애물(폭:{obs_w:.2f}m, 깊이:{obs_l:.2f}m) 감지 -> 트인 {self.avoid_side} 90도 회피 (목표가로:{self.target_avoid_width_m:.2f}m, 세로:{self.target_avoid_length_m:.2f}m)",
                         scores=scores,
                         is_stuck=False,
                         target_x=self.target_x,
@@ -1072,65 +1089,9 @@ class PathRecommender:
                         robot_heading_deg=self.robot_heading_deg,
                     )
 
-                # 초음파 센서 근접 보정
-                if self.ble_right_cm < 25.0 and self.ble_left_cm < 25.0:
-                    best_s = max(scores, key=lambda s: s.clearance_m)
-                    chosen_angle = best_s.angle_deg if best_s.clearance_m > 0.2 else 90.0
-                    self._send_ble(str(int(chosen_angle)))
-                    return PathRecommendation(
-                        best_angle_deg=chosen_angle,
-                        best_label=best_s.label if best_s.clearance_m > 0.2 else "Right-90",
-                        reason=f"양측 초음파 25cm 미만 (R:{self.ble_right_cm:.1f}cm L:{self.ble_left_cm:.1f}cm) -> {chosen_angle:+.0f}도 긴급 회피 조향",
-                        scores=scores,
-                        is_stuck=False,
-                        target_x=self.target_x,
-                        target_y=self.target_y,
-                        target_name=self.target_name,
-                        dist_to_goal_m=dist_m,
-                        goal_rel_angle_deg=goal_rel_angle,
-                        is_goal_reached=False,
-                        robot_x=self.robot_x,
-                        robot_y=self.robot_y,
-                        robot_heading_deg=self.robot_heading_deg,
-                    )
-                elif 0.0 < self.ble_right_cm < 10.0:
-                    self._send_ble("-30")
-                    return PathRecommendation(
-                        best_angle_deg=-30.0,
-                        best_label="Front-L",
-                        reason=f"우측 초음파 근접 ({self.ble_right_cm:.1f}cm < 10cm) -> 좌측 보정 조향",
-                        scores=scores,
-                        is_stuck=False,
-                        target_x=self.target_x,
-                        target_y=self.target_y,
-                        target_name=self.target_name,
-                        dist_to_goal_m=dist_m,
-                        goal_rel_angle_deg=goal_rel_angle,
-                        is_goal_reached=False,
-                        robot_x=self.robot_x,
-                        robot_y=self.robot_y,
-                        robot_heading_deg=self.robot_heading_deg,
-                    )
-                elif 0.0 < self.ble_left_cm < 10.0:
-                    self._send_ble("30")
-                    return PathRecommendation(
-                        best_angle_deg=30.0,
-                        best_label="Front-R",
-                        reason=f"좌측 초음파 근접 ({self.ble_left_cm:.1f}cm < 10cm) -> 우측 보정 조향",
-                        scores=scores,
-                        is_stuck=False,
-                        target_x=self.target_x,
-                        target_y=self.target_y,
-                        target_name=self.target_name,
-                        dist_to_goal_m=dist_m,
-                        goal_rel_angle_deg=goal_rel_angle,
-                        is_goal_reached=False,
-                        robot_x=self.robot_x,
-                        robot_y=self.robot_y,
-                        robot_heading_deg=self.robot_heading_deg,
-                    )
-
-                # 정상 직진 전진 주행
+                # ─────────────────────────────────────────────────────────
+                # [안정적 직진 전진 주행] 전방이 확보되어 있으면 옆에 벽이 있더라도 직진 유지!
+                # ─────────────────────────────────────────────────────────
                 chosen_angle = 0.0
                 chosen_label = "Front"
                 reason_msg = f"[{stage_name}] 직진 전진 주행 중 (전방 {front_clearance:.2f}m 확보)"

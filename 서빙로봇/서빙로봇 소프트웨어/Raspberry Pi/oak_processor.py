@@ -118,6 +118,9 @@ class OakProcessor:
     # ── 프레임 처리 메인 ──────────────────────────────────────────
     # 최신 프레임을 가져와 처리하는 메서드
     def get_frame(self) -> Optional[OakFrame]:
+        if getattr(self, "q_depth", None) is None or getattr(self, "q_rgb", None) is None:
+            return None
+
         in_depth = self.q_depth.tryGet()  # 깊이 큐에서 데이터 가져오기 (비블로킹)
         if in_depth is None:  # 데이터가 없으면
             return None  # None 반환
