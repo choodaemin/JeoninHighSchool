@@ -1,6 +1,6 @@
 """
 path_recommender.py
-서빙 로봇 19방향 하이브리드 경로 추천 & 7단계 ㄷ자 장애물 회피 시스템
+서빙 로봇 19방향 하이브리드 경로 추천 & 4단계 ㄷ자 장애물 회피 시스템
 
 핵심 아키텍처 및 동작 로직:
   1. [19방향 레이마칭 & 50x50cm 풋프린트 스코어링]
@@ -10,15 +10,14 @@ path_recommender.py
   2. [목표 지향 2단계 순차 자율주행 (X축 정렬 -> Y축 정렬)]
      - 시작 위치 원점 기준 상대 좌표 추적 및 10cm 이내 도달 시 정지 및 목표 도착(GOAL_REACHED) 처리.
 
-  3. [7단계 ㄷ자형 완전 회피 & 원래 레인 복귀 상태 머신]
+  3. [4단계 ㄷ자형 회피 상태 머신 (완료 즉시 목표 지향 주행으로 복귀)]
      - 0단계 (AVOID_BRAKE)       : 전방 장애물(30cm) 감지 시 관성 제동 및 완전 정지
      - 1단계 (AVOID_TURN_90)      : 더 넓게 트인 측면으로 직각 90도 회전
      - 2단계 (AVOID_PASS_WIDTH)   : 실측 장애물 폭에 맞춘 가로 직진 & 측면 초음파 감시
      - 3단계 (AVOID_TURN_FRONT)   : 원래 진행 방향으로 정렬 회전
-     - 4단계 (AVOID_PASS_LENGTH)  : 실측 장애물 길이에 맞춘 세로 추월 직진 (초음파 이탈 감지)
-     - 5단계 (AVOID_TURN_RETURN)  : 원래 주행 레인으로 복귀 선회
-     - 6단계 (AVOID_PASS_RETURN)  : 비껴간 가로 거리만큼 복귀 직진
-     - 7단계 (AVOID_TURN_FINAL)   : 최종 진행 방향 정렬 후 정상 주행 재개
+     - 4단계 (AVOID_PASS_LENGTH)  : 실측 장애물 길이에 맞춘 세로 추월 직진 (초음파 이탈 감지) -> 완료 시 IDLE
+     - 원래 지나가던 레인으로 굳이 복귀하지 않고, 장애물을 지나친 "현재 위치"에서 바로 2번(목표 지향 주행)이
+       다시 dx/dy를 계산해 목표를 향해 재조준한다. 레인 복귀용 회전+직진 왕복이 없어 더 짧고 빠르다.
 
   4. [다중 센서 융합 & 에러 세이프가드]
      - 라이다(LiDAR) + 뎁스 카메라(OAK-D) + 좌/우 초음파 센서 융합
@@ -35,6 +34,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
+import config
 from mapper import OccupancyMap, CELL_WALL, CELL_OBSTACLE
 
 
@@ -71,7 +71,7 @@ class PathRecommendation:
 
 class PathRecommender:
     # ── 설정 ─────────────────────────────────────────────────────
-    FRONT_STOP_DIST_M = 0.30   # 전방 장애물 감지 기준 거리 (코앞 30cm 이내일 때만 회피)
+    FRONT_STOP_DIST_M = config.ZONE_DANGER_M  # 전방 장애물 감지 기준 거리 (config의 즉시정지 거리와 통일)
     ROBOT_HALF_M      = 0.25   # 로봇 몸체 절반 (50cm / 2 = 25cm)
     SAFE_MARGIN_M     = 0.30   # 몸체 반폭 + 안전 여유 (25cm + 5cm)
     MAX_RANGE_M       = 3.0    # 센서 최대 탐색 거리 (m)
@@ -79,6 +79,10 @@ class PathRecommender:
     STOP_ANGLE        = -1.0   # 정지 신호
     UTURN_ANGLE       = 180.0  # 유턴 신호
     ARRIVE_MARGIN_M   = 0.10   # 목표 도착 판단 오차 거리 (0.10m = 10cm 주변 도달 시 정지)
+    AXIS_ALIGN_DONE_M      = 0.10  # X/Y 축 정렬 완료로 볼 오차 (히스테리시스 하한)
+    AXIS_REALIGN_TRIGGER_M = 0.15  # 정렬 완료 후 다시 재정렬로 들어갈 오차 (히스테리시스 상한, 경계 근처 진동 방지)
+    HEADING_ALIGN_DONE_DEG      = 15.0  # 헤딩 정렬 완료로 볼 오차 (히스테리시스 하한)
+    HEADING_REALIGN_TRIGGER_DEG = 20.0  # 정렬 완료 후 다시 턴을 시작할 오차 (히스테리시스 상한, 경계 근처 진동 방지)
 
     # ㄷ자 회피 거리 상수 (m)
     MIN_AVOID_WIDTH_M  = 0.40   # 90도 회전 후 가로 폭 최소 직진 보장 거리 (40cm)
@@ -127,8 +131,6 @@ class PathRecommender:
         self.avoid_side: str = "RIGHT"          # "RIGHT" (+90도 우회전 후 좌측초음파 감시) | "LEFT" (-90도 좌회전 후 우측초음파 감시)
         self.avoid_base_head: float = 0.0       # 장애물 감지 시점의 원래 진행 목표 각도 (0, 90, -90, 180)
         self.avoid_target_head: Optional[float] = None
-        self.avoid_return_target_head: Optional[float] = None  # 복귀 방향 90도 목표 각도
-        self.avoid_width_dist: float = 0.40     # 2단계에서 실제 이동한 가로 폭 거리 (복귀 시 동일 거리 복귀용)
         self.target_avoid_width_m: float = 0.40   # 장애물 크기 기반 동적 목표 가로 회피 거리
         self.target_avoid_length_m: float = 0.45  # 장애물 크기 기반 동적 목표 세로 추월 거리
         self.obs_measured_w: float = 0.0        # 실측 장애물 가로 폭 (m)
@@ -151,6 +153,7 @@ class PathRecommender:
         self.turn_angle = 0.0    # 회피 방향 각도
         self.turn_label = ""     # 회피 방향 라벨
         self.turn_timer = 0      # 회피 유지 프레임
+        self._heading_turning = False  # 직전 프레임에 헤딩 턴 중이었는지 (히스테리시스용)
 
         # 목표 좌표 관련 변수
         self.target_x: Optional[float] = None
@@ -293,6 +296,23 @@ class PathRecommender:
         rel_angle_deg = (rel_angle_deg + 180.0) % 360.0 - 180.0
 
         return dist_m, rel_angle_deg, goal_global_deg
+
+    def _is_still_turning(self, target_heading_deg: float) -> Tuple[bool, float]:
+        """
+        목표 절대 헤딩(target_heading_deg)과 현재 헤딩의 오차를 계산하고,
+        히스테리시스를 적용해 "아직 턴 중인지"를 판정한다.
+        - 직전 프레임에 턴 중이었다면 HEADING_ALIGN_DONE_DEG(15도)까지 좁혀져야 정렬 완료로 본다.
+        - 직전 프레임에 턴 중이 아니었다면(직진 중) HEADING_REALIGN_TRIGGER_DEG(20도)를
+          넘어야 다시 턴을 시작한다.
+        오차가 15~20도 경계 근처에서 노이즈로 흔들려도 턴↔직진을 계속 왔다갔다하지 않도록 함.
+
+        Returns: (is_turning, head_err)
+        """
+        current_head = (self.robot_heading_deg - self.origin_heading + 180.0) % 360.0 - 180.0
+        head_err = (target_heading_deg - current_head + 180.0) % 360.0 - 180.0
+        threshold = self.HEADING_ALIGN_DONE_DEG if self._heading_turning else self.HEADING_REALIGN_TRIGGER_DEG
+        self._heading_turning = abs(head_err) > threshold
+        return self._heading_turning, head_err
 
     def _get_heading_alignment_steering(self, target_heading_deg: float) -> Tuple[float, str]:
         """
@@ -525,6 +545,34 @@ class PathRecommender:
 
         return clearance
 
+    # ── 경고 구역 완만한 조향 (정지 없이 살짝 피해가기) ─────────────
+    NUDGE_ANGLES_DEG = (-20.0, -10.0, 10.0, 20.0)  # 완만한 회피 시 후보로 고려할 작은 각도들
+    NUDGE_MARGIN_M   = 0.15  # 직진(0도)보다 이만큼 더 트여 있어야 옆으로 살짝 트는 걸 채택
+
+    def _compute_gentle_steering(self, front_clearance: float, scores: List["DirectionScore"]) -> Tuple[float, str]:
+        """
+        전방이 ZONE_WARNING_M(경고 구역) 안으로 들어왔지만 아직 FRONT_STOP_DIST_M(즉시정지 구역)
+        만큼 가깝진 않을 때, 완전히 멈추고 90도 ㄷ자 회피를 시작하는 대신 작은 각도(±10/±20도)로
+        살짝 조향해서 부드럽게 피해가도록 한다. 상용 로봇의 DWA류 로컬 플래너를 이산적 명령
+        인터페이스 안에서 흉내낸 것 — 매 프레임 재계산되며 상태를 남기지 않는다.
+        """
+        if front_clearance >= config.ZONE_WARNING_M:
+            return 0.0, "Front"  # 충분히 트여 있음 -> 직진
+
+        by_angle = {s.angle_deg: s.clearance_m for s in scores}
+        best_angle, best_clearance = 0.0, front_clearance
+
+        for angle_deg in self.NUDGE_ANGLES_DEG:
+            clearance = by_angle.get(angle_deg)
+            # 직진보다 확실히(NUDGE_MARGIN_M 이상) 더 트인 방향만 채택 (미세한 차이로 인한 좌우 흔들림 방지)
+            if clearance is not None and clearance > best_clearance + self.NUDGE_MARGIN_M:
+                best_angle, best_clearance = angle_deg, clearance
+
+        if best_angle == 0.0:
+            return 0.0, "Front"
+        label = f"Right-{int(best_angle)}" if best_angle > 0 else f"Left-{int(abs(best_angle))}"
+        return best_angle, label
+
     # ── 메인 추천 엔진 ───────────────────────────────────────────
     def recommend(self) -> PathRecommendation:
         """
@@ -673,10 +721,9 @@ class PathRecommender:
 
                 # 1단계: 직각 90도 선회 (현재 진행 방향 기준 상대적 90도)
                 elif getattr(self, "avoid_state", "IDLE") == "AVOID_TURN_90":
-                    current_head = (self.robot_heading_deg - self.origin_heading + 180.0) % 360.0 - 180.0
-                    head_err = (self.avoid_target_head - current_head + 180.0) % 360.0 - 180.0
+                    is_turning_avoid, head_err = self._is_still_turning(self.avoid_target_head)
 
-                    if abs(head_err) > 15.0:
+                    if is_turning_avoid:
                         chosen_angle, chosen_label = self._get_heading_alignment_steering(self.avoid_target_head)
                         reason_msg = f"[회피 1단계: 90도 선회] {self.avoid_side} 90도({self.avoid_target_head:+.0f}°) 회전 중 (오차:{head_err:+.1f}°, 조향:{chosen_label})"
                     else:
@@ -730,7 +777,6 @@ class PathRecommender:
                                      (self.avoid_step_timeout <= 0)
 
                     if can_turn_front:
-                        self.avoid_width_dist = max(target_w, moved_dist) # 실제 비껴간 가로 거리 저장 (복귀용)
                         self.avoid_state = "AVOID_TURN_FRONT"
                         self.avoid_target_head = self.avoid_base_head
                         self.avoid_clear_count = 0
@@ -760,10 +806,9 @@ class PathRecommender:
 
                 # 3단계: 원래 진행 방향(avoid_base_head)으로 선회
                 elif getattr(self, "avoid_state", "IDLE") == "AVOID_TURN_FRONT":
-                    current_head = (self.robot_heading_deg - self.origin_heading + 180.0) % 360.0 - 180.0
-                    head_err = (self.avoid_base_head - current_head + 180.0) % 360.0 - 180.0
+                    is_turning_avoid, head_err = self._is_still_turning(self.avoid_base_head)
 
-                    if abs(head_err) > 15.0:
+                    if is_turning_avoid:
                         chosen_angle, chosen_label = self._get_heading_alignment_steering(self.avoid_base_head)
                         reason_msg = f"[회피 3단계: 진행 방향 정렬] 원래 진행각({self.avoid_base_head:+.0f}°) 정렬 중 (오차:{head_err:+.1f}°, 조향:{chosen_label})"
                     else:
@@ -817,122 +862,16 @@ class PathRecommender:
                                        (self.avoid_step_timeout <= 0)
 
                     if can_start_return:
-                        # 5단계(원래 주행 레인 복귀 선회) 진입
-                        rel_return_deg = -90.0 if self.avoid_side == "RIGHT" else 90.0
-                        self.avoid_return_target_head = (self.avoid_base_head + rel_return_deg + 180.0) % 360.0 - 180.0
-                        self.avoid_state = "AVOID_TURN_RETURN"
-                        self.avoid_step_timeout = 100
-                        chosen_angle, chosen_label = self._get_heading_alignment_steering(self.avoid_return_target_head)
-                        reason_msg = f"[회피 5단계: 복귀 선회] 장애물 추월 완료 (이동:{moved_dist:.2f}m/{target_l:.2f}m) -> 복귀각({self.avoid_return_target_head:+.0f}°) 선회 시작"
-                    else:
-                        reason_msg = f"[회피 4단계: 세로 길이 추월] 장애물 몸통 추월 직진 중 (이동:{moved_dist:.2f}m/{target_l:.2f}m, 측면:{side_dist:.1f}cm)"
-
-                    self._send_ble(str(int(chosen_angle)))
-                    return PathRecommendation(
-                        best_angle_deg=chosen_angle,
-                        best_label=chosen_label,
-                        reason=reason_msg,
-                        scores=scores,
-                        is_stuck=False,
-                        target_x=self.target_x,
-                        target_y=self.target_y,
-                        target_name=self.target_name,
-                        dist_to_goal_m=dist_m,
-                        goal_rel_angle_deg=goal_rel_angle,
-                        is_goal_reached=False,
-                        robot_x=self.robot_x,
-                        robot_y=self.robot_y,
-                        robot_heading_deg=self.robot_heading_deg,
-                    )
-
-                # 5단계: 원래 주행 레인(복귀 방향)으로 90도 선회
-                elif getattr(self, "avoid_state", "IDLE") == "AVOID_TURN_RETURN":
-                    current_head = (self.robot_heading_deg - self.origin_heading + 180.0) % 360.0 - 180.0
-                    head_err = (self.avoid_return_target_head - current_head + 180.0) % 360.0 - 180.0
-
-                    if abs(head_err) > 15.0:
-                        chosen_angle, chosen_label = self._get_heading_alignment_steering(self.avoid_return_target_head)
-                        reason_msg = f"[회피 5단계: 복귀 선회] 복귀각({self.avoid_return_target_head:+.0f}°) 정렬 중 (오차:{head_err:+.1f}°, 조향:{chosen_label})"
-                    else:
-                        # 복귀 선회 완료 시점 -> 6단계(가로 폭 복귀 직진) 진입 (기준 좌표 기록)
-                        self.avoid_state = "AVOID_PASS_RETURN"
-                        self.avoid_start_x = self.robot_x
-                        self.avoid_start_y = self.robot_y
-                        self.avoid_step_timeout = 100
-                        chosen_angle = 0.0
-                        chosen_label = "Front"
-                        reason_msg = f"[회피 6단계: 기준선 복귀 직진] 복귀 선회 완료 -> 원래 레인으로 직진 시작 (목표 복귀: {self.avoid_width_dist:.2f}m)"
-
-                    self._send_ble(str(int(chosen_angle)))
-                    return PathRecommendation(
-                        best_angle_deg=chosen_angle,
-                        best_label=chosen_label,
-                        reason=reason_msg,
-                        scores=scores,
-                        is_stuck=False,
-                        target_x=self.target_x,
-                        target_y=self.target_y,
-                        target_name=self.target_name,
-                        dist_to_goal_m=dist_m,
-                        goal_rel_angle_deg=goal_rel_angle,
-                        is_goal_reached=False,
-                        robot_x=self.robot_x,
-                        robot_y=self.robot_y,
-                        robot_heading_deg=self.robot_heading_deg,
-                    )
-
-                # 6단계: 가로 폭 복귀 직진 (2단계에서 비껴간 거리만큼 복귀)
-                elif getattr(self, "avoid_state", "IDLE") == "AVOID_PASS_RETURN":
-                    chosen_angle = 0.0
-                    chosen_label = "Front"
-                    self.avoid_step_timeout -= 1
-
-                    moved_dist = math.hypot(self.robot_x - self.avoid_start_x, self.robot_y - self.avoid_start_y)
-
-                    if moved_dist >= self.avoid_width_dist or self.avoid_step_timeout <= 0:
-                        # 7단계(최종 진행 방향 정렬) 진입
-                        self.avoid_state = "AVOID_TURN_FINAL"
-                        self.avoid_step_timeout = 100
-                        chosen_angle, chosen_label = self._get_heading_alignment_steering(self.avoid_base_head)
-                        reason_msg = f"[회피 7단계: 최종 정렬] 기준선 복귀 완료 (이동:{moved_dist:.2f}m) -> 원래 진행각({self.avoid_base_head:+.0f}°) 최종 정렬 시작"
-                    else:
-                        reason_msg = f"[회피 6단계: 기준선 복귀 직진] 원래 주행 라인으로 복귀 직진 중 (이동:{moved_dist:.2f}m/{self.avoid_width_dist:.2f}m)"
-
-                    self._send_ble(str(int(chosen_angle)))
-                    return PathRecommendation(
-                        best_angle_deg=chosen_angle,
-                        best_label=chosen_label,
-                        reason=reason_msg,
-                        scores=scores,
-                        is_stuck=False,
-                        target_x=self.target_x,
-                        target_y=self.target_y,
-                        target_name=self.target_name,
-                        dist_to_goal_m=dist_m,
-                        goal_rel_angle_deg=goal_rel_angle,
-                        is_goal_reached=False,
-                        robot_x=self.robot_x,
-                        robot_y=self.robot_y,
-                        robot_heading_deg=self.robot_heading_deg,
-                    )
-
-                # 7단계: 원래 진행 방향(avoid_base_head)으로 최종 정렬 후 회피 완료
-                elif getattr(self, "avoid_state", "IDLE") == "AVOID_TURN_FINAL":
-                    current_head = (self.robot_heading_deg - self.origin_heading + 180.0) % 360.0 - 180.0
-                    head_err = (self.avoid_base_head - current_head + 180.0) % 360.0 - 180.0
-
-                    if abs(head_err) > 15.0:
-                        chosen_angle, chosen_label = self._get_heading_alignment_steering(self.avoid_base_head)
-                        reason_msg = f"[회피 7단계: 최종 정렬] 원래 진행각({self.avoid_base_head:+.0f}°) 정렬 중 (오차:{head_err:+.1f}°, 조향:{chosen_label})"
-                    else:
-                        # ㄷ자 완전 회피 및 기준선 복귀 완료 -> IDLE 전환
+                        # 장애물을 완전히 지나침 -> 회피 종료. 원래 레인으로 복귀하지 않고,
+                        # 현재 위치에서 바로 목표 지향 주행(ALIGN_X/ALIGN_Y)이 dx/dy를 새로 계산해 재조준한다.
                         self.avoid_state = "IDLE"
                         self.avoid_target_head = None
-                        self.avoid_return_target_head = None
                         self.avoid_clear_count = 0
                         chosen_angle = 0.0
                         chosen_label = "Front"
-                        reason_msg = f"[ㄷ자 회피 완료] 원래 주행 레인 완벽 복귀 완료 -> 목표 경로 주행 재개"
+                        reason_msg = f"[ㄷ자 회피 완료] 장애물 추월 완료 (이동:{moved_dist:.2f}m/{target_l:.2f}m) -> 원래 레인 복귀 없이 목표 방향으로 바로 재조준"
+                    else:
+                        reason_msg = f"[회피 4단계: 세로 길이 추월] 장애물 몸통 추월 직진 중 (이동:{moved_dist:.2f}m/{target_l:.2f}m, 측면:{side_dist:.1f}cm)"
 
                     self._send_ble(str(int(chosen_angle)))
                     return PathRecommendation(
@@ -960,7 +899,7 @@ class PathRecommender:
 
                 # 1단계 vs 2단계 목표 헤딩 결정 (전방=+X(0도), 좌측=+Y(-90도), 우측=-Y(+90도), 후방=-X(180도))
                 if self.sub_stage == "ALIGN_X":
-                    if abs(dx) > 0.10:
+                    if abs(dx) > self.AXIS_ALIGN_DONE_M:
                         target_head = 0.0 if dx > 0 else 180.0
                         stage_name = "1단계 X정렬"
                     else:
@@ -968,16 +907,18 @@ class PathRecommender:
                         target_head = -90.0 if dy >= 0 else 90.0
                         stage_name = "2단계 Y정렬 전환"
                 elif self.sub_stage == "ALIGN_Y":
-                    if abs(dy) > 0.10:
+                    if abs(dy) > self.AXIS_ALIGN_DONE_M:
                         target_head = -90.0 if dy >= 0 else 90.0
                         stage_name = "2단계 Y정렬"
                     else:
-                        if abs(dx) > 0.10:
+                        # 재정렬 진입은 완료 기준(0.10m)보다 넉넉한 히스테리시스 기준(0.15m)을 써서,
+                        # dx가 0.10m 경계 근처에서 노이즈로 흔들려도 X<->Y 사이를 계속 왔다갔다하지 않도록 함.
+                        if abs(dx) > self.AXIS_REALIGN_TRIGGER_M:
                             self.sub_stage = "ALIGN_X"
                             target_head = 0.0 if dx > 0 else 180.0
                             stage_name = "1단계 X재정렬"
                         else:
-                            # X, Y 모두 0.10m 이내 도착
+                            # Y는 0.10m 이내, X는 재정렬을 걸 정도(0.15m)는 아님 -> 도착 처리
                             self.state = "GOAL_REACHED"
                             self.avoid_state = "IDLE"
                             self.aligning_heading = False
@@ -999,10 +940,8 @@ class PathRecommender:
                                 robot_heading_deg=self.robot_heading_deg,
                             )
 
-                # 현재 로봇 헤딩과 목표 각도 간의 오차 계산
-                current_head = (self.robot_heading_deg - self.origin_heading + 180.0) % 360.0 - 180.0
-                head_err = (target_head - current_head + 180.0) % 360.0 - 180.0
-                is_turning = abs(head_err) > 15.0
+                # 현재 로봇 헤딩과 목표 각도 간의 오차 계산 (히스테리시스 적용)
+                is_turning, head_err = self._is_still_turning(target_head)
 
                 # ─────────────────────────────────────────────────────────
                 # [규칙] 제자리에서 턴을 할 때는 장애물 인식을 통한 방향 추천을 하지 않음!
@@ -1090,11 +1029,14 @@ class PathRecommender:
                     )
 
                 # ─────────────────────────────────────────────────────────
-                # [안정적 직진 전진 주행] 전방이 확보되어 있으면 옆에 벽이 있더라도 직진 유지!
+                # [직진/완만한 회피 주행] 전방이 충분히 트였으면 직진, 경고 구역(ZONE_WARNING_M)
+                # 안이면 완전히 멈추지 않고 작은 각도로 살짝 조향해 부드럽게 피해감
                 # ─────────────────────────────────────────────────────────
-                chosen_angle = 0.0
-                chosen_label = "Front"
-                reason_msg = f"[{stage_name}] 직진 전진 주행 중 (전방 {front_clearance:.2f}m 확보)"
+                chosen_angle, chosen_label = self._compute_gentle_steering(front_clearance, scores)
+                if chosen_angle == 0.0:
+                    reason_msg = f"[{stage_name}] 직진 전진 주행 중 (전방 {front_clearance:.2f}m 확보)"
+                else:
+                    reason_msg = f"[{stage_name}] 경고 구역 완만한 회피 조향({chosen_label}) 중 (전방 {front_clearance:.2f}m)"
                 self._send_ble(str(int(chosen_angle)))
                 return PathRecommendation(
                     best_angle_deg=chosen_angle,
@@ -1113,12 +1055,17 @@ class PathRecommender:
                     robot_heading_deg=self.robot_heading_deg,
                 )
             else:
-                # 목표가 없는 일반 직진
-                self._send_ble("0")
+                # 목표가 없는 일반 직진 (경고 구역이면 완만한 회피 조향)
+                chosen_angle, chosen_label = self._compute_gentle_steering(front_clearance, scores)
+                reason_msg = (
+                    f"직진 주행 중 (전방 {front_clearance:.2f}m 확보)" if chosen_angle == 0.0
+                    else f"경고 구역 완만한 회피 조향({chosen_label}) 중 (전방 {front_clearance:.2f}m)"
+                )
+                self._send_ble(str(int(chosen_angle)))
                 return PathRecommendation(
-                    best_angle_deg=0.0,
-                    best_label="Front",
-                    reason=f"직진 주행 중 (전방 {front_clearance:.2f}m 확보)",
+                    best_angle_deg=chosen_angle,
+                    best_label=chosen_label,
+                    reason=reason_msg,
                     scores=scores,
                     is_stuck=False,
                     target_x=self.target_x,
@@ -1265,7 +1212,6 @@ class PathRecommender:
             if self.turn_timer <= 0 and front_clearance >= self.FRONT_STOP_DIST_M:
                 self.state = "FORWARD"
                 self._send_ble("0")
-                self._update_odometry_step(0.0)
                 return PathRecommendation(
                     best_angle_deg=0.0,
                     best_label="Front",
@@ -1290,7 +1236,6 @@ class PathRecommender:
                 self.turn_label = f"Avoid-{int(self.turn_angle)}"
                 self.turn_timer = 6
                 self._send_ble(str(int(self.turn_angle)))
-                self._update_odometry_step(self.turn_angle)
                 return PathRecommendation(
                     best_angle_deg=self.turn_angle,
                     best_label=self.turn_label,
@@ -1310,7 +1255,6 @@ class PathRecommender:
 
             # 회피 방향 송신 유지
             self._send_ble(str(int(self.turn_angle)))
-            self._update_odometry_step(self.turn_angle)
             return PathRecommendation(
                 best_angle_deg=self.turn_angle,
                 best_label=self.turn_label,
@@ -1330,7 +1274,6 @@ class PathRecommender:
 
         # 안전장치 폴백
         self.state = "FORWARD"
-        self._update_odometry_step(0.0)
         return PathRecommendation(
             best_angle_deg=0.0,
             best_label="Front",

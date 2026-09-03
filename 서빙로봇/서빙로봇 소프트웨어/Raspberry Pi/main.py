@@ -55,11 +55,21 @@ def main(use_mock: bool = False, visualize: bool = True):
     oak_proc: OakProcessor | None = None
     if not use_mock:
         try:
-            oak_proc = OakProcessor()  # OAK 카메라 처리기 생성
-            oak_proc.start()  # OAK 카메라 시작
-            print("[Main] OAK-D-Lite 연결 완료")  # 연결 성공 메시지
+            # OakProcessor() 생성 자체는 dai 라이브러리 설치 여부만 확인하므로 하드웨어가
+            # 아직 없어도 실패하지 않는다. 여기서 실패하면 복구 불가능한 상태이므로 완전히 비활성화.
+            oak_proc = OakProcessor()
         except Exception as e:
-            print(f"[Main] OAK 연결 실패: {e} → OAK 없이 LiDAR 단독 모드")  # 연결 실패 시 LiDAR만 사용
+            oak_proc = None
+            print(f"[Main] OAK 사용 불가: {e} → OAK 없이 LiDAR 단독 모드")
+
+        if oak_proc is not None:
+            try:
+                oak_proc.start()  # OAK 카메라 시작 (여기서는 실제 USB 연결을 시도)
+                print("[Main] OAK-D-Lite 연결 완료")  # 연결 성공 메시지
+            except Exception as e:
+                # 초기 연결 실패는 치명적이지 않다 - USB 열거 지연 등 일시적 상황일 수 있으므로
+                # oak_proc 는 살려두고, get_frame() 내부의 3초 쿨다운 자동 재연결에 복구를 맡긴다.
+                print(f"[Main] OAK 초기 연결 실패: {e} → LiDAR 단독으로 시작, 백그라운드에서 자동 재연결 시도")
 
     # LiDAR 프로세서를 시작합니다.
     lidar_proc.start()

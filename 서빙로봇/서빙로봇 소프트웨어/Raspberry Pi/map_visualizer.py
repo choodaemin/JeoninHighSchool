@@ -419,9 +419,11 @@ class MapVisualizer:
         tgt_y = recommendation.target_y if recommendation else None
 
         for p_key, (px_m, py_m, p_name) in self.TABLE_PRESETS.items():
-            rel_x = px_m - (recommendation.robot_x if recommendation else 0.0)
-            rel_y = py_m - (recommendation.robot_y if recommendation else 0.0)
-            row_p, col_p = self.occ_map.world_to_cell(rel_x, rel_y)
+            # px_m/py_m, robot_x/robot_y 는 오도메트리 좌표계(전방=+X, 좌측=+Y).
+            # 맵 좌표계(우측=+x, 전방=+y)로 축을 바꿔서 world_to_cell 에 전달.
+            rel_fwd  = px_m - (recommendation.robot_x if recommendation else 0.0)
+            rel_left = py_m - (recommendation.robot_y if recommendation else 0.0)
+            row_p, col_p = self.occ_map.world_to_cell(-rel_left, rel_fwd)
             cx = offset_x + int(col_p * px + px / 2)
             cy = offset_y + int(row_p * px + px / 2)
 
@@ -493,10 +495,11 @@ class MapVisualizer:
 
         # 목표 지점 표시
         if rec.target_x is not None and rec.target_y is not None:
-            rel_tx = rec.target_x - rec.robot_x
-            rel_ty = rec.target_y - rec.robot_y
+            # 오도메트리 좌표계(전방=+X, 좌측=+Y) -> 맵 좌표계(우측=+x, 전방=+y) 축 변환
+            rel_fwd  = rec.target_x - rec.robot_x
+            rel_left = rec.target_y - rec.robot_y
 
-            row_t, col_t = self.occ_map.world_to_cell(rel_tx, rel_ty)
+            row_t, col_t = self.occ_map.world_to_cell(-rel_left, rel_fwd)
             tx = offset_x + int(col_t * px + px / 2)
             ty = offset_y + int(row_t * px + px / 2)
 

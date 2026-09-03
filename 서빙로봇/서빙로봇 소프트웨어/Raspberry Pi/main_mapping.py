@@ -57,13 +57,21 @@ def main(use_mock: bool = False, visualize: bool = True):
     oak_proc: Optional[OakProcessor] = None
     if not use_mock:
         try:
-            temp_oak = OakProcessor()
-            temp_oak.start()
-            oak_proc = temp_oak
-            print("[System] OAK-D-Lite Camera Initialized.")
+            # OakProcessor() 생성 자체는 dai 라이브러리 설치 여부만 확인하므로 하드웨어가
+            # 아직 없어도 실패하지 않는다. 여기서 실패하면 복구 불가능한 상태이므로 완전히 비활성화.
+            oak_proc = OakProcessor()
         except Exception as e:
             oak_proc = None
-            print(f"[System] OAK-D-Lite Init Failed: {e} -> LiDAR Single Mode")
+            print(f"[System] OAK-D-Lite Unavailable: {e} -> LiDAR Single Mode")
+
+        if oak_proc is not None:
+            try:
+                oak_proc.start()
+                print("[System] OAK-D-Lite Camera Initialized.")
+            except Exception as e:
+                # 초기 연결 실패는 치명적이지 않다 - oak_proc 는 살려두고 get_frame() 내부의
+                # 3초 쿨다운 자동 재연결에 복구를 맡긴다 (USB 열거 지연 등 일시적 상황 대응).
+                print(f"[System] OAK-D-Lite Init Failed: {e} -> LiDAR Single Mode (auto-reconnect in background)")
 
     # ── 2. UI 및 상태 변수 초기화 ────────────────────────────────────
     win_name = "Serving Robot Control Dashboard (1280x960)"
@@ -253,6 +261,12 @@ def main(use_mock: bool = False, visualize: bool = True):
                 classified_objects = classifier.classify(lidar_scan, oak_frame)
 
             occ_map.prepare_frame()
+            # 센서 데이터를 찍기 전에 로봇의 현재 오도메트리 자세를 맵에 반영
+            occ_map.set_robot_pose(
+                recommender.robot_x,
+                recommender.robot_y,
+                recommender.robot_heading_deg,
+            )
             if lidar_scan is not None:
                 occ_map.update_from_lidar(lidar_scan)
             if oak_frame:
@@ -410,7 +424,7 @@ def main(use_mock: bool = False, visualize: bool = True):
 def _update_map_from_classified(occ_map: OccupancyMap, classified_objects: List[ClassifiedObject]): 
     for obj in classified_objects:
         if obj.object_type in (ObjectType.PERSON, ObjectType.OBSTACLE, ObjectType.GLASS_WALL):
-            rad = math.radians(obj.angle_deg)
+            rad = math.radians(obj.angle_deg + occ_map.robot_heading_deg)
             x_m = obj.distance_m * math.sin(rad)
             y_m = obj.distance_m * math.cos(rad)
             row, col = occ_map.world_to_cell(x_m, y_m)

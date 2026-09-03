@@ -36,15 +36,16 @@ class MapCell:
 class OccupancyMap:
     """
     2D 점유 격자 맵.
-    로봇 위치가 맵 중앙에 고정되고, 센서 데이터가 누적된다.
+    맵 자체는 월드 좌표계에 고정되고, 로봇은 set_robot_pose()로 전달받은
+    오도메트리를 따라 맵 위를 이동하며, 센서 데이터가 그 위치 기준으로 누적된다.
     """
 
     def __init__(self):
         # 맵 해상도 설정 (미터/셀)
         self.resolution = config.FUSION_GRID_RESOLUTION
         # 맵 크기 설정 (미터)
-        self.width_m    = 10.0     # 맵 가로 크기 (m)
-        self.height_m   = 10.0    # 맵 세로 크기 (m)
+        self.width_m    = config.FUSION_GRID_WIDTH_M   # 맵 가로 크기 (m)
+        self.height_m   = config.FUSION_GRID_HEIGHT_M  # 맵 세로 크기 (m)
 
         # 셀 단위 크기 계산
         self.width_cells  = int(self.width_m  / self.resolution)
@@ -63,18 +64,44 @@ class OccupancyMap:
         self.free_count     = np.zeros_like(self.grid, dtype=np.int32)    # 빈 공간 감지 카운트
         self.last_hit_time  = np.zeros_like(self.grid, dtype=np.float64)  # 장애물이 마지막으로 감지된 시간 (s)
         self.OBSTACLE_MEMORY_SEC = 5.0  # 장애물 메모리 보존 시간 (5초 동안 책상 상판을 라이다가 지우지 못하도록 보호)
+        self.STATIC_PROMOTE_HIT_COUNT = 8  # 이 횟수를 초과해 일관되게 감지되면 static_grid(영구 지도)에 편입
 
-        # 로봇 위치 설정 (맵 중앙)
+        # 로봇 현재 위치 (맵 중앙에서 시작하며, set_robot_pose 호출 시 실제 이동을 따라 갱신됨)
         self.robot_col = self.width_cells  // 2
         self.robot_row = self.height_cells // 2
+
+        # 월드 좌표 원점(오도메트리 0,0 지점)에 해당하는 셀 - 최초 1회 고정
+        self._origin_col = self.robot_col
+        self._origin_row = self.robot_row
+
+        # 로봇 현재 자세 (맵 좌표계: x=우측+, y=전방+ / 헤딩: 전방 0도, 우측 +90도)
+        self.robot_world_x    = 0.0
+        self.robot_world_y    = 0.0
+        self.robot_heading_deg = 0.0
 
         # 마지막 업데이트 시간
         self.last_update = time.time()
 
+    # ── 로봇 자세(오도메트리) 반영 ────────────────────────────────
+    def set_robot_pose(self, x_fwd_m: float, y_left_m: float, heading_deg: float):
+        """
+        BLE 오도메트리로 받은 로봇의 현재 자세를 맵에 반영한다.
+
+        입력 좌표계(PathRecommender/BLE): 전방=+X, 좌측=+Y, 헤딩 0도=전방 / +90도=우측
+        맵 좌표계: x=우측+, y=전방+ (world_to_cell 이 이 축을 기준으로 동작)
+        """
+        self.robot_world_x     = -y_left_m   # 좌측(+Y) → 맵의 우측(+x) 기준으로 부호 반전
+        self.robot_world_y     = x_fwd_m     # 전방(+X) → 맵의 전방(+y)
+        self.robot_heading_deg = heading_deg
+
+        # 고정 원점 셀로부터의 변위로 현재 로봇 셀 위치를 갱신
+        self.robot_col = self._origin_col + int(round(self.robot_world_x / self.resolution))
+        self.robot_row = self._origin_row - int(round(self.robot_world_y / self.resolution))
+
     # ── 좌표 변환 ─────────────────────────────────────────────────
     # 월드 좌표(미터)를 맵 셀 인덱스로 변환하는 메서드
     def world_to_cell(self, x_m: float, y_m: float) -> Tuple[int, int]:
-        """직교 좌표(m) → 격자 인덱스 (row, col). 로봇 위치 기준."""
+        """직교 좌표(m) → 격자 인덱스 (row, col). 로봇의 현재 위치 기준."""
         # 로봇 위치를 기준으로 셀 인덱스 계산
         col = self.robot_col + int(round(x_m / self.resolution))  # x → col
         row = self.robot_row - int(round(y_m / self.resolution))  # y → row (y축 반전)
@@ -110,10 +137,10 @@ class OccupancyMap:
             if point.distance_m <= 0:  # 거리가 유효하지 않으면
                 continue  # 건너뜀
 
-            # 포인트의 극좌표를 직교좌표로 변환
-            rad   = math.radians(point.angle_deg)  # 각도를 라디안으로
-            x_end = point.distance_m * math.sin(rad)  # 끝점 x
-            y_end = point.distance_m * math.cos(rad)  # 끝점 y
+            # 포인트의 극좌표를 직교좌표로 변환 (로봇 헤딩만큼 회전시켜 월드 방향으로 정렬)
+            rad   = math.radians(point.angle_deg + self.robot_heading_deg)  # 로봇 헤딩 보정 후 라디안 변환
+            x_end = point.distance_m * math.sin(rad)  # 끝점 x (로봇 현재 위치 기준 상대 좌표)
+            y_end = point.distance_m * math.cos(rad)  # 끝점 y (로봇 현재 위치 기준 상대 좌표)
 
             # 끝점을 셀 인덱스로 변환
             end_row, end_col = self.world_to_cell(x_end, y_end)
@@ -159,8 +186,8 @@ class OccupancyMap:
             if obs.is_wall:  # 벽이면 건너뜀
                 continue
 
-            # 장애물의 극좌표를 직교좌표로 변환
-            rad   = math.radians(obs.angle_deg)
+            # 장애물의 극좌표를 직교좌표로 변환 (로봇 헤딩만큼 회전시켜 월드 방향으로 정렬)
+            rad   = math.radians(obs.angle_deg + self.robot_heading_deg)
             x_end = obs.distance_m * math.sin(rad)
             y_end = obs.distance_m * math.cos(rad)
 
@@ -191,18 +218,28 @@ class OccupancyMap:
     # ── 셀 상태 갱신 ──────────────────────────────────────────────
     # 셀의 상태를 hit/free 카운트 비율 및 장애물 메모리로 결정하는 내부 메서드
     def _update_cell(self, row: int, col: int, now: Optional[float] = None):
-        """hit/free 카운트 비율 및 5초 장애물 메모리 보호로 셀 상태 결정"""
+        """hit/free 카운트 비율, 5초 장애물 메모리 보호, 영구 승격 여부로 셀 상태 결정"""
         if now is None:
             now = time.time()
-
-        # [핵심] 최근 5초 이내에 카메라/라이다가 장애물로 등록한 셀은 강제로 장애물 유지!
-        if (now - self.last_hit_time[row, col] < self.OBSTACLE_MEMORY_SEC) and (self.hit_count[row, col] >= 2):
-            self.grid[row, col] = CELL_OBSTACLE
-            return
 
         hit  = self.hit_count[row, col]  # 장애물 감지 횟수
         free = self.free_count[row, col]  # 빈 공간 감지 횟수
         total = hit + free  # 총 감지 횟수
+
+        # [영구 승격] 충분히 여러 번(STATIC_PROMOTE_HIT_COUNT회 초과), 일관되게(비율 0.40 초과)
+        # 장애물로 확인된 셀은 static_grid(영구 지도)에 편입시킨다.
+        # 이후엔 센서 시야를 벗어나거나 다음 세션에 다시 켜도 계속 기억된다.
+        # (사람처럼 움직이는 대상은 한 셀에서 hit_count가 이 정도까지 쌓이기 전에 자리를 벗어나므로
+        #  자연히 승격되지 않는다.)
+        if hit > self.STATIC_PROMOTE_HIT_COUNT and total > 0 and (hit / total) > 0.40:
+            self.static_grid[row, col] = CELL_WALL
+            self.grid[row, col] = CELL_WALL
+            return
+
+        # [핵심] 최근 5초 이내에 카메라/라이다가 장애물로 등록한 셀은 강제로 장애물 유지!
+        if (now - self.last_hit_time[row, col] < self.OBSTACLE_MEMORY_SEC) and (hit >= 2):
+            self.grid[row, col] = CELL_OBSTACLE
+            return
 
         if total == 0:  # 감지 기록이 없으면
             return  # 상태 유지
@@ -210,8 +247,9 @@ class OccupancyMap:
         hit_ratio = hit / total  # 장애물 비율 계산
 
         if hit_ratio > 0.40:  # 장애물 비율이 높으면 (기존 0.55에서 0.40으로 민감도 향상)
-            # 벽인지 일반 장애물인지 구분 (히트 수가 많으면 벽)
-            self.grid[row, col] = CELL_WALL if hit > 8 else CELL_OBSTACLE
+            # 위의 영구 승격 분기에서 이미 hit > STATIC_PROMOTE_HIT_COUNT 인 경우를 처리했으므로
+            # 여기 도달하는 건 항상 승격 기준에 못 미치는(아직 확신이 약한) 일반 장애물이다.
+            self.grid[row, col] = CELL_OBSTACLE
         elif hit_ratio < 0.15:  # 빈 공간 비율이 압도적일 때만 빈 공간으로 설정
             self.grid[row, col] = CELL_FREE  # 빈 공간으로 설정
         # 그 사이는 현재 상태 유지 (불확실 영역)
@@ -274,37 +312,56 @@ class OccupancyMap:
         half_width_m: float = 0.8
     ) -> Tuple[float, float, float]:
         """
-        로봇 전방 관심 영역(ROI) 내 장애물 클러스터의 실제 물리적 크기(가로 폭, 세로 깊이, 최근접 거리)를 측정.
-        
+        로봇 전방 관심 영역(ROI, 로봇의 현재 헤딩 기준) 내 장애물 클러스터의
+        실제 물리적 크기(가로 폭, 세로 깊이, 최근접 거리)를 측정.
+
+        맵 격자 자체는 회전하지 않으므로, 로봇 주변을 넉넉히 포함하는
+        월드좌표 정사각형 윈도우를 먼저 자른 뒤 각 셀을 로봇 헤딩만큼
+        역회전시켜 "로봇 로컬 전방/좌우" 기준으로 판정한다.
+
         Returns:
             (width_m, length_m, nearest_dist_m)
         """
-        x_min, x_max = -half_width_m, half_width_m
         y_min, y_max = 0.05, max_dist_m
 
-        # 격자 범위 계산
-        r_top, c_left  = self.world_to_cell(x_min, y_max)
-        r_bot, c_right = self.world_to_cell(x_max, y_min)
+        # 회전된 ROI(사각형)를 항상 포함할 수 있는 정사각형 탐색 반경
+        search_radius_m = math.hypot(half_width_m, max_dist_m)
+        r_span = int(math.ceil(search_radius_m / self.resolution)) + 1
 
-        r_start = max(0, min(r_top, r_bot))
-        r_end   = min(self.height_cells, max(r_top, r_bot) + 1)
-        c_start = max(0, min(c_left, c_right))
-        c_end   = min(self.width_cells, max(c_left, c_right) + 1)
+        r_start = max(0, self.robot_row - r_span)
+        r_end   = min(self.height_cells, self.robot_row + r_span + 1)
+        c_start = max(0, self.robot_col - r_span)
+        c_end   = min(self.width_cells, self.robot_col + r_span + 1)
 
-        roi = self.grid[r_start:r_end, c_start:c_end]
-        obs_mask = (roi >= CELL_WALL)
+        window = self.grid[r_start:r_end, c_start:c_end]
+        obs_rows, obs_cols = np.where(window >= CELL_WALL)
 
-        if not np.any(obs_mask):
+        if obs_rows.size == 0:
             return 0.40, 0.45, 999.0  # 장애물 감지 안 됨 (기본값)
 
-        # 장애물 셀 인덱스 추출
-        obs_rows, obs_cols = np.where(obs_mask)
         global_rows = obs_rows + r_start
         global_cols = obs_cols + c_start
 
-        # 월드 좌표 변환
-        xs = (global_cols - self.robot_col) * self.resolution
-        ys = (self.robot_row - global_rows) * self.resolution
+        # 로봇 기준 월드 좌표 (x=우측+, y=전방+, 헤딩 회전 미반영)
+        x_world = (global_cols - self.robot_col) * self.resolution
+        y_world = (self.robot_row - global_rows) * self.resolution
+
+        # 로봇 헤딩만큼 역회전 -> 로봇 로컬 좌표(x=로봇 우측+, y=로봇 전방+)
+        h = math.radians(self.robot_heading_deg)
+        cos_h, sin_h = math.cos(h), math.sin(h)
+        x_local = x_world * cos_h - y_world * sin_h
+        y_local = x_world * sin_h + y_world * cos_h
+
+        # 로봇 로컬 기준 전방 ROI(가로 ±half_width_m, 세로 y_min~y_max) 안의 셀만 채택
+        in_roi = (
+            (x_local >= -half_width_m) & (x_local <= half_width_m) &
+            (y_local >= y_min) & (y_local <= y_max)
+        )
+        if not np.any(in_roi):
+            return 0.40, 0.45, 999.0  # 장애물 감지 안 됨 (기본값)
+
+        xs = x_local[in_roi]
+        ys = y_local[in_roi]
 
         width_m  = float(np.max(xs) - np.min(xs) + self.resolution)
         length_m = float(np.max(ys) - np.min(ys) + self.resolution)
@@ -326,12 +383,18 @@ class OccupancyMap:
         return filepath
 
     def save_map(self, filepath: str = "saved_map.npz") -> bool:
-        """현재 점유 격자 맵을 압축 파일(.npz)과 시각화 이미지(.png)로 동시 저장"""
+        """
+        누적된 영구 지도(static_grid)를 압축 파일(.npz)과 시각화 이미지(.png)로 저장.
+        static_grid는 사전에 불러온 지도 + 이번 세션에서 충분히 반복 확인되어
+        영구 승격된(hit_count > STATIC_PROMOTE_HIT_COUNT) 셀들로 구성된다.
+        self.grid(순간 스냅샷)를 저장하면 사람 등 일시적으로 지나가던 대상이
+        그대로 박제될 수 있어 static_grid를 저장한다.
+        """
         filepath = self._resolve_path(filepath)
         try:
             np.savez_compressed(
                 filepath,
-                grid=self.grid,
+                grid=self.static_grid,
                 hit_count=self.hit_count,
                 free_count=self.free_count,
                 resolution=self.resolution,
@@ -343,10 +406,10 @@ class OccupancyMap:
             )
             # 사람이 열어볼 수 있는 PNG 이미지로도 함께 저장
             img_path = filepath.rsplit(".", 1)[0] + ".png"
-            norm_map = np.full(self.grid.shape, 128, dtype=np.uint8) # 기본 미지: 128
-            norm_map[self.grid == CELL_FREE] = 230      # 빈 공간: 밝은 흰색/회색
-            norm_map[self.grid == CELL_WALL] = 80       # 벽: 진한 회색
-            norm_map[self.grid >= CELL_OBSTACLE] = 0    # 장애물: 검정색
+            norm_map = np.full(self.static_grid.shape, 128, dtype=np.uint8) # 기본 미지: 128
+            norm_map[self.static_grid == CELL_FREE] = 230      # 빈 공간: 밝은 흰색/회색
+            norm_map[self.static_grid == CELL_WALL] = 80       # 벽: 진한 회색
+            norm_map[self.static_grid >= CELL_OBSTACLE] = 0    # 장애물: 검정색
 
             import cv2
             cv2.imwrite(img_path, norm_map)
@@ -385,8 +448,15 @@ class OccupancyMap:
             return False
 
     def prepare_frame(self):
-        """매 프레임 센서 업데이트 전 호출: 사전 저장된 정적 맵(static_grid)을 베이스로 유지"""
-        self.grid[:] = self.static_grid[:]
+        """
+        매 프레임 센서 업데이트 전 호출: 사전 저장된 정적 맵(static_grid)을 베이스로 유지하되,
+        최근 OBSTACLE_MEMORY_SEC(기본 5초) 이내에 확인된 장애물 셀은 이번 프레임에 센서
+        시야를 벗어났더라도 그대로 유지한다 (OAK처럼 시야각이 좁은 센서가 잠깐 다른 곳을
+        보는 사이 장애물이 지도에서 사라지는 것을 방지).
+        """
+        now = time.time()
+        protected = (self.hit_count >= 2) & ((now - self.last_hit_time) < self.OBSTACLE_MEMORY_SEC)
+        self.grid[:] = np.where(protected, CELL_OBSTACLE, self.static_grid)
 
     # 맵 전체를 초기화하는 메서드 (사용자 초기화 버튼 클릭 시)
     def reset(self):

@@ -12,6 +12,8 @@ OAK-D-Lite 깊이 데이터 획득 및 전처리
 
 import numpy as np  # NumPy 라이브러리 (배열 계산)
 import cv2  # OpenCV 라이브러리 (이미지 처리)
+import time  # 재연결 쿨다운/타임스탬프 계산
+import threading  # 재연결을 백그라운드 스레드로 분리해 메인 루프 블로킹 방지
 try:
     import depthai as dai  # DepthAI 라이브러리 (OAK 카메라 제어)
 except ImportError:
@@ -19,6 +21,7 @@ except ImportError:
 from dataclasses import dataclass, field  # 데이터 클래스 정의
 from typing import Optional, Tuple, List  # 타입 힌트
 import config  # 설정 파일에서 상수 가져옴
+from console_utils import safe_print as _safe_print
 
 
 # OAK 카메라에서 감지한 단일 장애물 정보를 나타내는 데이터 클래스
@@ -48,13 +51,20 @@ class OakProcessor:
     """OAK-D-Lite 처리 클래스"""
 
     def __init__(self):
+        if dai is None:
+            raise RuntimeError("DepthAI 라이브러리가 설치되지 않았습니다.")
         # 파이프라인과 큐 초기화
         self.pipeline = None  # DepthAI 파이프라인 객체
         self.device = None    # 연결된 디바이스 객체
         self.q_depth = None   # 깊이 데이터 큐
         self.q_rgb = None     # RGB 데이터 큐
         self.latest_rgb = None # 최신 RGB 프레임 캐시 메모리
-        self._setup_pipeline()  # 파이프라인 설정
+        self._last_reconnect_time = 0.0  # 재연결 쿨다운 타임스탬프
+        self._consecutive_errors = 0     # get_frame() 연속 실패 횟수 (일시적 글리치와 실제 단선 구분용)
+        self._reconnect_lock = threading.Lock()  # 재연결 스레드 중복 실행 방지용 (진행 중 표시 겸용)
+        self._device_lock = threading.Lock()     # device/q_depth/q_rgb 네이티브 호출 상호배제용
+        self._shutdown_requested = threading.Event()  # stop() 이후 백그라운드 재연결이 디바이스를 되살리지 못하게 막는 플래그
+        # 파이프라인은 start() 가 호출될 때마다 새로 구성한다 (여기서는 dai 설치 여부만 검증)
 
     # ── 파이프라인 구성 ────────────────────────────────────────────
     # DepthAI 파이프라인을 구성하는 내부 메서드
@@ -105,48 +115,141 @@ class OakProcessor:
 
     # OAK 디바이스를 시작하는 메서드
     def start(self):
-        self.device = dai.Device(self.pipeline)  # 파이프라인으로 디바이스 연결
-        self.q_depth = self.device.getOutputQueue("depth", maxSize=4, blocking=False)  # 깊이 큐 생성
-        self.q_rgb   = self.device.getOutputQueue("rgb",   maxSize=4, blocking=False)  # RGB 큐 생성
-        print("[OAK] 디바이스 연결 완료")  # 연결 성공 메시지
+        self._setup_pipeline()  # 재연결 시에도 항상 새 파이프라인으로 구성 (파이프라인 재사용 불가)
+        # 느린 하드웨어 연결(dai.Device())은 락 밖에서 수행해 get_frame() 을 블로킹하지 않는다.
+        new_device = dai.Device(self.pipeline)  # 파이프라인으로 디바이스 연결
+        try:
+            new_q_depth = new_device.getOutputQueue("depth", maxSize=4, blocking=False)  # 깊이 큐 생성
+            new_q_rgb   = new_device.getOutputQueue("rgb",   maxSize=4, blocking=False)  # RGB 큐 생성
+        except Exception:
+            # 큐 생성 중 실패 시 절반만 초기화된 디바이스를 그대로 두지 않고 정리
+            try:
+                new_device.close()
+            except Exception:
+                pass
+            raise
+        # 실제 교체는 짧게 락을 잡고 원자적으로 수행 (get_frame() 의 네이티브 호출과 상호배제).
+        # 연결이 진행되는 동안 stop() 이 이미 호출됐다면(_shutdown_requested), 방금 연 디바이스를
+        # 되살리지 않고 그대로 닫아 버려 "종료했는데 뒤늦게 재연결되는" 레이스를 막는다.
+        with self._device_lock:
+            if self._shutdown_requested.is_set():
+                try:
+                    new_device.close()
+                except Exception:
+                    pass
+                raise RuntimeError("OAK 종료 요청으로 연결을 취소함")
+            self.device = new_device
+            self.q_depth = new_q_depth
+            self.q_rgb = new_q_rgb
+            self.latest_rgb = None
+            self._consecutive_errors = 0
+        _safe_print("[OAK] 디바이스 연결 완료")  # 연결 성공 메시지
 
-    # OAK 디바이스를 정지하는 메서드
+    # OAK 디바이스를 정지하는 메서드 (외부에서 호출하는 영구 종료용)
     def stop(self):
-        if self.device:  # 디바이스가 있으면
-            self.device.close()  # 연결 종료
+        self._shutdown_requested.set()
+        self._close_device()
+        # 진행 중인 백그라운드 재연결 스레드가 있다면 끝날 때까지 잠시 대기한다.
+        # start() 가 dai.Device() 연결에 성공한 직후(=self.device 를 막 채운 뒤) stop() 이
+        # 호출됐다면, 위의 _close_device() 는 그 디바이스가 아직 열리기 전이라 아무것도
+        # 못 닫았을 수 있다 (닫을 게 없어서 즉시 반환). 재연결 스레드가 마저 끝날 때까지
+        # 기다린 뒤 한 번 더 정리하면, 그 사이에 새로 열렸을 수 있는 디바이스까지 확실히 닫힌다.
+        if self._reconnect_lock.acquire(timeout=5.0):
+            self._reconnect_lock.release()
+        self._close_device()
+
+    def _close_device(self):
+        """현재 device 를 닫고 참조를 정리 (영구 종료/재연결 전 정리 양쪽에서 공용으로 사용)"""
+        # 참조를 락 안에서 떼어낸 뒤, 느릴 수 있는 close() 는 락 밖에서 수행한다.
+        # get_frame() 이 q_depth/q_rgb 를 쓰는 구간은 항상 이 락을 잡고 있으므로,
+        # 여기서 None 으로 바꾸는 순간 이후로는 옛 device 를 만지는 스레드가 없음이 보장된다.
+        with self._device_lock:
+            device = self.device
+            self.device = None
+            self.q_depth = None
+            self.q_rgb = None
+        if device:
+            try:
+                device.close()
+            except Exception:
+                pass
+
+    def _try_reconnect(self):
+        """
+        연결 끊김 시 3초 쿨다운 후 백그라운드 스레드에서 자동 재연결 시도.
+        dai.Device() 연결 자체가 수 초까지 걸릴 수 있는 블로킹 호출이라,
+        메인 제어 루프(get_frame() 호출부)를 멈추지 않도록 별도 스레드에서 실행한다.
+        """
+        if self._shutdown_requested.is_set():
+            return
+        now = time.time()
+        if now - self._last_reconnect_time < 3.0:
+            return
+        if not self._reconnect_lock.acquire(blocking=False):
+            return  # 이미 재연결 스레드가 진행 중
+        self._last_reconnect_time = now
+        threading.Thread(target=self._reconnect_worker, daemon=True).start()
+
+    def _reconnect_worker(self):
+        """백그라운드 스레드에서 실행되는 실제 재연결 작업 (_reconnect_lock 보유 중)"""
+        try:
+            _safe_print("[OAK] 🔄 카메라 재연결 시도 중... (백그라운드)")
+            self._close_device()
+            self.start()
+            _safe_print("[OAK] ✅ 카메라 자동 재연결 성공!")
+        except Exception as e:
+            _safe_print(f"[OAK] 재연결 대기 중 ({e})")
+        finally:
+            self._reconnect_lock.release()
 
     # ── 프레임 처리 메인 ──────────────────────────────────────────
     # 최신 프레임을 가져와 처리하는 메서드
     def get_frame(self) -> Optional[OakFrame]:
-        if getattr(self, "q_depth", None) is None or getattr(self, "q_rgb", None) is None:
-            return None
+        # device/q_depth/q_rgb 에 대한 네이티브 호출은 전부 이 락 안에서 수행한다.
+        # _reconnect_worker 가 백그라운드 스레드에서 stop()/start() 로 같은 객체들을
+        # 닫고/새로 여는 것과 동시에 실행되면 DepthAI 네이티브 핸들에 대한 레이스로
+        # 프로세스가 죽을 수 있기 때문에, 같은 락으로 상호배제한다.
+        with self._device_lock:
+            if self.q_depth is None or self.q_rgb is None:
+                self._try_reconnect()
+                return None
 
-        in_depth = self.q_depth.tryGet()  # 깊이 큐에서 데이터 가져오기 (비블로킹)
-        if in_depth is None:  # 데이터가 없으면
-            return None  # None 반환
+            try:
+                in_depth = self.q_depth.tryGet()  # 깊이 큐에서 데이터 가져오기 (비블로킹)
+                if in_depth is None:  # 데이터가 없으면
+                    return None  # None 반환
 
-        import time  # 시간 모듈 임포트
-        depth_raw = in_depth.getFrame()   # 원시 깊이 프레임 가져오기 (uint16, mm 단위)
-        depth_m   = depth_raw.astype(np.float32) / 1000.0  # mm를 m로 변환
+                depth_raw = in_depth.getFrame()   # 원시 깊이 프레임 가져오기 (uint16, mm 단위)
+                depth_m   = depth_raw.astype(np.float32) / 1000.0  # mm를 m로 변환
 
-        # ── RGB 프레임 획득 및 큐 비우기 ──
-        # 최초 기동 시 RGB 데이터가 아직 준비되지 않았다면 최대 1.0초간 대기하며 획득 보장
-        t_start = time.time()
-        while self.latest_rgb is None and (time.time() - t_start) < 1.0:
-            in_rgb = self.q_rgb.tryGet()
-            if in_rgb is not None:
-                self.latest_rgb = in_rgb.getCvFrame()
-                break
-            time.sleep(0.01)
+                # ── RGB 프레임 획득 및 큐 비우기 ──
+                # 최초 기동 시 RGB 데이터가 아직 준비되지 않았다면 최대 1.0초간 대기하며 획득 보장
+                t_start = time.time()
+                while self.latest_rgb is None and (time.time() - t_start) < 1.0:
+                    in_rgb = self.q_rgb.tryGet()
+                    if in_rgb is not None:
+                        self.latest_rgb = in_rgb.getCvFrame()
+                        break
+                    time.sleep(0.01)
 
-        # 큐에 쌓여 있는 밀린 RGB 프레임들을 전부 소진하여 가장 최신 프레임으로 캐시 업데이트
-        while True:
-            in_rgb = self.q_rgb.tryGet()
-            if in_rgb is None:
-                break
-            self.latest_rgb = in_rgb.getCvFrame()
+                # 큐에 쌓여 있는 밀린 RGB 프레임들을 전부 소진하여 가장 최신 프레임으로 캐시 업데이트
+                while True:
+                    in_rgb = self.q_rgb.tryGet()
+                    if in_rgb is None:
+                        break
+                    self.latest_rgb = in_rgb.getCvFrame()
+            except Exception as e:
+                # 한두 프레임의 일시적 디코딩 글리치까지 매번 전체 재연결로 처리하지 않도록
+                # 연속 실패가 임계치를 넘을 때만 실제 단선으로 간주해 자원 정리 후 재연결 트리거
+                self._consecutive_errors += 1
+                _safe_print(f"[OAK] 프레임 획득 오류 ({self._consecutive_errors}회 연속): {e}")
+                if self._consecutive_errors >= 3:
+                    # stop()/start() 는 _try_reconnect() 가 스폰하는 백그라운드 스레드에서 처리 (메인 루프 논블로킹 유지)
+                    self._try_reconnect()
+                return None
 
-        rgb = self.latest_rgb
+            self._consecutive_errors = 0
+            rgb = self.latest_rgb
 
         # 유효 마스크 생성 (범위 내 + 노이즈 제거)
         valid_mask = self._build_valid_mask(depth_m)
