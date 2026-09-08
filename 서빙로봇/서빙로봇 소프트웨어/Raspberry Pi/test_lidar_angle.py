@@ -20,9 +20,11 @@ import math
 import cv2
 import numpy as np
 from rplidar import RPLidar
+import config
 
-PORT     = "COM6"
-OFFSET   = -95.6   # 현재 config.py 값과 동일하게 맞추세요
+PORT      = config.LIDAR_PORT
+OFFSET    = config.LIDAR_ANGLE_OFFSET_DEG  # config.py 값을 그대로 사용 (두 곳이 어긋나지 않도록)
+SELF_EXCL = config.LIDAR_SELF_EXCLUSION_M  # 자체반사 제외 반경 (lidar_processor.py 와 동일 필터)
 
 def normalize(angle, offset):
     angle = (angle + offset) % 360.0
@@ -70,6 +72,13 @@ try:
             px  = int(cx + dist_m * math.sin(rad) * scale)
             py  = int(cy - dist_m * math.cos(rad) * scale)
 
+            # [자체반사 제외] lidar_processor.py 실전 필터와 동일하게 적용.
+            # 회색으로 표시만 하고 최근접/정상 색상 판정에서는 뺀다 (필터가
+            # 그 0.23~0.24m 고리를 실제로 걷어내는지 육안 확인용).
+            if dist_m < SELF_EXCL:
+                cv2.circle(canvas, (px, py), 2, (70, 70, 70), -1)
+                continue
+
             # 가장 가까운 포인트 추적
             if dist_m < min_dist:
                 min_dist  = dist_m
@@ -86,10 +95,10 @@ try:
                     f"Nearest: {min_dist:.2f}m  angle: {min_angle:+.1f}deg",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,100), 1)
         cv2.putText(canvas,
-                    f"Offset: {OFFSET}deg  (edit test_lidar_angle.py)",
+                    f"Offset: {OFFSET}deg  SelfExcl: {SELF_EXCL:.2f}m  (config.py)",
                     (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180,180,180), 1)
         cv2.putText(canvas,
-                    "Green = front +-30deg  Blue = other",
+                    "Green = front +-30deg  Blue = other  Gray = self-reflection (excluded)",
                     (10, SIZE-15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150,150,150), 1)
 
         win_title = "LiDAR Angle Test (q=quit)"
