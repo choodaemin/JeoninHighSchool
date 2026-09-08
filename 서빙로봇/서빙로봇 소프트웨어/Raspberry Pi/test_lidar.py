@@ -1,7 +1,7 @@
 # test_lidar.py
 from rplidar import RPLidar
 
-lidar = RPLidar('COM7', baudrate=115200, timeout=3)
+lidar = RPLidar('COM6', baudrate=115200, timeout=3)
 lidar.connect()
 print(lidar.get_info())
 print(lidar.get_health())

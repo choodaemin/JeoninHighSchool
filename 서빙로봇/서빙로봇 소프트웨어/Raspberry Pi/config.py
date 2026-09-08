@@ -17,11 +17,14 @@ OAK_EDGE_MARGIN = 0.15  # 화면 가장자리 15% 는 신뢰도 낮음
 OAK_DEPTH_STD_THRESH = 80  # 표준편차(mm) 초과 시 노이즈 픽셀
 
 # ─── LiDAR 설정 ────────────────────────────────────────────────────
-LIDAR_PORT = "COM7"  # 시리얼 포트
+LIDAR_PORT = "COM6"  # 시리얼 포트
 LIDAR_BAUDRATE = 115200
 LIDAR_MIN_RANGE_M = 0.15  # 유효 거리 최솟값 (m)
 LIDAR_MAX_RANGE_M = 12.0  # 유효 거리 최댓값 (m)
 LIDAR_ANGLE_RESOLUTION = 1.0  # 각도 해상도 (도)
+# 라이다 장착 각도 보정. test_lidar_angle.py 로 로봇 정면에 손을 대고 실측:
+# OFFSET 180도 기준 -84.4도로 측정됨 -> 필요한 오프셋 = 180 - (-84.4) = 264.4 -> -95.6도
+LIDAR_ANGLE_OFFSET_DEG = -95.6
 # config.py 에 추가
 LIDAR_FOV_DEG = 180.0  # 사용할 LiDAR 시야각 (정면 기준 ±90도)
 

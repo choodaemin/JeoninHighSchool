@@ -21,8 +21,8 @@ import cv2
 import numpy as np
 from rplidar import RPLidar
 
-PORT     = "COM7"
-OFFSET   = 180.0   # 현재 config.py 값과 동일하게 맞추세요
+PORT     = "COM6"
+OFFSET   = -95.6   # 현재 config.py 값과 동일하게 맞추세요
 
 def normalize(angle, offset):
     angle = (angle + offset) % 360.0

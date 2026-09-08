@@ -55,7 +55,11 @@ def _lidar_worker(scan_queue: Queue, stop_event, use_mock: bool):
         return abs(angle_deg) > half_fov
 
     def normalize_angle(angle: float) -> float:
-        angle = angle % 360.0
+        # LIDAR_ANGLE_OFFSET_DEG: 라이다 장착 각도 보정 (test_lidar_angle.py 로 실측)
+        # 라이다 원점(0도)이 로봇 정면과 어긋나 있으면, 이 보정 없이는
+        # LIDAR_FOV_DEG(180도) 필터가 엉뚱한 반원(예: 뒤쪽)을 정면으로 오인해
+        # 뒤쪽 벽이 맵의 전방 장애물로 나타난다.
+        angle = (angle + getattr(config, "LIDAR_ANGLE_OFFSET_DEG", 0.0)) % 360.0
         if angle > 180.0:
             angle -= 360.0
         return angle
