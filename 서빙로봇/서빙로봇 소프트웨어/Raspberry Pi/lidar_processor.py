@@ -7,14 +7,70 @@ LiDAR 멀티프로세싱 버전
 - 스레드 대신 프로세스 분리로 GIL 우회 및 과부하 방지
 """
 
+import json
 import math
+import os
 import time
 import multiprocessing
 from multiprocessing import Process, Queue
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import config
+
+
+# ── 각도별 자체반사 프로파일 (calibrate_lidar_self_mask.py 로 생성) ──────
+# 로봇 몸체/트레이 칸막이는 원형이 아니므로, 균일 반경 하나로는 가까운 방향에
+# 맞추면 먼 방향(예: ㄷ자 칸막이의 안쪽 모서리)이 새고, 먼 방향에 맞추면
+# 가까운 방향에서 실제 장애물 감지 거리를 깎아먹는다. 각도 구간마다 캘리브레이션된
+# 임계값을 쓰면 이 트레이드오프가 없다. 캘리브레이션 파일이 없으면(아직 실행 전,
+# 혹은 로봇 구조 변경 후 재생성 전) config.LIDAR_SELF_EXCLUSION_M 균일 반경으로
+# 자동 폴백한다.
+SELF_MASK_ANGLE_STEP_DEG = 2.0
+
+
+def _self_mask_path() -> str:
+    filename = getattr(config, "LIDAR_SELF_MASK_FILE", "lidar_self_mask.json")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+
+def load_self_mask() -> Optional[Tuple[float, List[float]]]:
+    """각도별 자체반사 제외 거리(m) 프로파일을 불러온다. 없거나 손상되면 None."""
+    path = _self_mask_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        step = float(data["angle_step_deg"])
+        values = [float(v) for v in data["thresholds_m"]]
+        if step <= 0 or not values:
+            return None
+        return step, values
+    except Exception as e:
+        print(f"[LiDAR] 자체반사 프로파일 로드 실패({path}): {e} - 균일 반경으로 폴백")
+        return None
+
+
+def self_exclusion_threshold(
+    angle_deg: float,
+    mask: Optional[Tuple[float, List[float]]],
+    fallback_m: float,
+) -> float:
+    """
+    지정 각도(오프셋 보정 완료된 로봇 기준 각도)에서 적용할 자체반사 제외 거리(m).
+    mask 가 없으면 균일 반경(fallback_m)을 그대로 쓴다.
+    캘리브레이션 오염(캘리브레이션 중 실제 장애물이 끼어든 경우) 방어를 위해
+    센서 최소 측정거리 ~ LIDAR_SELF_MASK_MAX_M 범위로 항상 클리핑한다.
+    """
+    lo = config.LIDAR_MIN_RANGE_M
+    hi = getattr(config, "LIDAR_SELF_MASK_MAX_M", 0.45)
+    if mask is None:
+        return min(max(fallback_m, lo), hi)
+    step, values = mask
+    n = len(values)
+    idx = int(((angle_deg + 180.0) % 360.0) / step) % n
+    return min(max(values[idx], lo), hi)
 
 
 # ── 데이터 클래스 (프로세스 간 공유 가능해야 하므로 단순 구조 유지) ──
@@ -124,6 +180,12 @@ def _lidar_worker(scan_queue: Queue, stop_event, use_mock: bool):
     # ── 실제 하드웨어 루프 ────────────────────────────────────────
     lidar_hw = None
     half_lidar_fov = getattr(config, 'LIDAR_FOV_DEG', 360.0) / 2.0
+    self_mask = load_self_mask()
+    if self_mask is not None:
+        print(f"[LiDAR] 자체반사 프로파일 로드: {_self_mask_path()}")
+    else:
+        print(f"[LiDAR] 자체반사 프로파일 없음 - 균일 반경 {config.LIDAR_SELF_EXCLUSION_M:.2f}m 로 폴백 "
+              f"(calibrate_lidar_self_mask.py 실행 권장)")
 
     try:
         from rplidar import RPLidar
@@ -149,12 +211,13 @@ def _lidar_worker(scan_queue: Queue, stop_event, use_mock: bool):
                             continue
                         if dist_m < config.LIDAR_MIN_RANGE_M or dist_m > config.LIDAR_MAX_RANGE_M:
                             continue
-                        # [자체반사 제외] 로봇 몸체(마운트/브래킷 등)에 라이다 빔이 맞고
-                        # 튕겨 돌아오는 반사. 실측: 로봇을 제자리에서 돌려도 0.23~0.24m
-                        # 거리의 점 무리가 로봇과 같이 회전 -> 방 안 물체가 아니라 몸체
-                        # 자체. LIDAR_MIN_RANGE_M(센서 최소 측정거리, 0.15m)만으로는
-                        # 못 걸러지므로(로봇 반경 0.25m보다 짧음) 별도 반경으로 제외한다.
-                        if dist_m < config.LIDAR_SELF_EXCLUSION_M:
+                        # [자체반사 제외] 로봇 몸체/트레이 칸막이(마운트, 브래킷, 측면 벽
+                        # 등)에 라이다 빔이 맞고 튕겨 돌아오는 반사. 실측: 로봇을 제자리에서
+                        # 돌려도 점 무리가 로봇과 같이 회전 -> 방 안 물체가 아니라 몸체 자체.
+                        # 이 구조가 원형이 아니라 ㄷ자(트레이 칸막이)라 방향마다 거리가
+                        # 다르므로, 균일 반경 대신 각도별 캘리브레이션 프로파일을 쓴다
+                        # (self_mask 가 없으면 LIDAR_SELF_EXCLUSION_M 균일 반경으로 폴백).
+                        if dist_m < self_exclusion_threshold(angle, self_mask, config.LIDAR_SELF_EXCLUSION_M):
                             continue
 
                         points.append(LidarPoint(
