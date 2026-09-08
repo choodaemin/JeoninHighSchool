@@ -98,6 +98,11 @@ def main():
     with open(path, "w", encoding="utf-8") as f:
         json.dump({
             "angle_step_deg": SELF_MASK_ANGLE_STEP_DEG,
+            # 이 프로파일은 각도 인덱스로 저장되므로, 캘리브레이션 당시의 각도
+            # 오프셋과 짝을 이룰 때만 유효하다. 오프셋이 바뀌면 같은 물리 방향이
+            # 다른 각도 라벨을 갖게 되어 프로파일 전체가 엉뚱한 방향에 적용된다.
+            # lidar_processor.load_self_mask() 가 이 값을 검사해서 불일치 시 거부한다.
+            "angle_offset_deg": config.LIDAR_ANGLE_OFFSET_DEG,
             "thresholds_m": thresholds.tolist(),
             "calibrated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "sample_count": sample_count.tolist(),

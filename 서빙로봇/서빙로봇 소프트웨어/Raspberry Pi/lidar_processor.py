@@ -46,6 +46,20 @@ def load_self_mask() -> Optional[Tuple[float, List[float]]]:
         values = [float(v) for v in data["thresholds_m"]]
         if step <= 0 or not values:
             return None
+
+        # [각도 오프셋 일치 검사] 프로파일은 각도 인덱스로 저장되므로 캘리브레이션
+        # 당시의 오프셋과 짝을 이룰 때만 유효하다. 오프셋을 바꾼 뒤 재캘리브레이션을
+        # 잊으면 같은 물리 방향이 다른 각도 라벨을 갖게 되어, 프로파일이 엉뚱한 방향에
+        # 적용되면서 실제 장애물을 자체반사로 오인해 지워버릴 수 있다. 조용히 넘어가면
+        # 원인 찾기가 매우 어려우므로 명시적으로 거부하고 균일 반경으로 폴백한다.
+        saved_offset = data.get("angle_offset_deg")
+        current_offset = getattr(config, "LIDAR_ANGLE_OFFSET_DEG", 0.0)
+        if saved_offset is None or abs(float(saved_offset) - current_offset) > 0.5:
+            print(f"[LiDAR] 자체반사 프로파일이 현재 각도 오프셋과 맞지 않습니다 "
+                  f"(프로파일: {saved_offset}, 현재: {current_offset}) - 무시하고 균일 반경으로 폴백. "
+                  f"calibrate_lidar_self_mask.py 를 다시 실행하세요.")
+            return None
+
         return step, values
     except Exception as e:
         print(f"[LiDAR] 자체반사 프로파일 로드 실패({path}): {e} - 균일 반경으로 폴백")
