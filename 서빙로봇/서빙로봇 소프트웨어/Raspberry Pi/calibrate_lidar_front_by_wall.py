@@ -40,7 +40,7 @@ WALL_MIN_DIST_M = 0.5    # 이보다 가까운 점은 벽 후보에서 제외 (�
 WALL_MAX_DIST_M = 4.0    # 이보다 먼 점은 제외 (노이즈/다른 방)
 RANSAC_ITERS = 200
 RANSAC_TOL_M = 0.02      # 직선에서 2cm 이내면 벽 위의 점으로 인정
-MIN_INLIERS = 40         # 이보다 적으면 신뢰할 수 없는 측정으로 간주
+MIN_INLIERS = 25         # 이보다 적으면 신뢰할 수 없는 측정으로 간주
 
 SELF_MASK = load_self_mask()
 SELF_FALLBACK_M = config.LIDAR_SELF_EXCLUSION_M
@@ -129,6 +129,9 @@ def main():
     scale = SIZE / 2 / 3.0  # 3m 범위
 
     normals = []
+    stats = []          # 스캔별 단계 통과 개수 (실패 원인 진단용)
+    front_dists = []    # 정면 방향에서 실제로 보인 거리들
+    best_cand = 0       # 한 스캔에서 나온 최대 후보점 수
     t0 = time.time()
 
     try:
@@ -143,17 +146,26 @@ def main():
             cv2.putText(canvas, "FRONT(0deg)", (cx + 6, cy - int(2.4 * scale)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
 
+            # [진단] 단계별로 점이 몇 개씩 살아남는지 세어, 실패 시 어느 필터가
+            # 원인인지 바로 알 수 있게 한다.
+            st = dict(raw=0, quality=0, range=0, self_excl=0, window=0, band=0)
+            near_front = []   # 정면 ±SEARCH_HALF_DEG 안의 거리들 (거리 조건 진단용)
+
             candidates = []
             for quality, angle_raw, dist_mm in scan:
+                st['raw'] += 1
                 if quality == 0 or dist_mm == 0:
                     continue
+                st['quality'] += 1
                 angle = normalize(float(angle_raw), OFFSET)
                 dist_m = dist_mm / 1000.0
                 if dist_m < config.LIDAR_MIN_RANGE_M:
                     continue
+                st['range'] += 1
                 # 실전 파이프라인과 동일한 자체반사 제외
                 if dist_m < self_exclusion_threshold(angle, SELF_MASK, SELF_FALLBACK_M):
                     continue
+                st['self_excl'] += 1
 
                 rad = math.radians(angle)
                 x, y = dist_m * math.sin(rad), dist_m * math.cos(rad)
@@ -161,11 +173,19 @@ def main():
                 py = int(cy - y * scale)
                 cv2.circle(canvas, (px, py), 2, (90, 90, 90), -1)
 
-                if (abs(angle) <= SEARCH_HALF_DEG
-                        and WALL_MIN_DIST_M <= dist_m <= WALL_MAX_DIST_M):
-                    candidates.append((x, y))
+                if abs(angle) <= SEARCH_HALF_DEG:
+                    st['window'] += 1
+                    near_front.append(dist_m)
+                    if WALL_MIN_DIST_M <= dist_m <= WALL_MAX_DIST_M:
+                        st['band'] += 1
+                        candidates.append((x, y))
+
+            stats.append(st)
+            if near_front:
+                front_dists.extend(near_front)
 
             result = fit_wall(np.array(candidates)) if len(candidates) >= MIN_INLIERS else None
+            best_cand = max(best_cand, len(candidates))
 
             if result is not None:
                 normal_deg, inliers, rms, wall_dist = result
@@ -183,7 +203,8 @@ def main():
                 status = (f"wall normal: {normal_deg:+.2f}deg  dist {wall_dist:.2f}m  "
                           f"pts {int(inliers.sum())}  rms {rms*1000:.0f}mm")
             else:
-                status = "wall not found - face a flat wall, clear the view"
+                status = (f"wall NOT found - candidates {len(candidates)} "
+                          f"(need {MIN_INLIERS}), in-window {st['window']}")
 
             cv2.putText(canvas, status, (10, 26), cv2.FONT_HERSHEY_SIMPLEX,
                         0.46, (255, 255, 100), 1)
@@ -207,10 +228,45 @@ def main():
 
     print("=" * 62)
     if len(normals) < 3:
-        print("측정 실패: 벽을 충분히 잡지 못했습니다.")
-        print("- 평평하고 넓은 벽을 정면에 두었는지")
-        print(f"- 벽까지 거리가 {WALL_MIN_DIST_M}~{WALL_MAX_DIST_M}m 범위인지")
-        print(f"- 현재 정면 기준 ±{SEARCH_HALF_DEG:.0f}도 안에 벽이 있는지 확인하세요.")
+        print("측정 실패: 벽을 충분히 잡지 못했습니다.\n")
+
+        if not stats:
+            print("라이다에서 스캔을 한 번도 받지 못했습니다.")
+            print(f"- 포트({config.LIDAR_PORT})가 맞는지, 다른 프로그램이 점유 중이 아닌지 확인하세요.")
+            return
+
+        # 단계별 평균 통과 개수 -> 어느 필터에서 걸렸는지 한눈에 보인다
+        keys = [("raw", "스캔 원본"), ("quality", "품질 통과"),
+                ("range", f"거리 > {config.LIDAR_MIN_RANGE_M}m"),
+                ("self_excl", "자체반사 제외 후"),
+                ("window", f"정면 ±{SEARCH_HALF_DEG:.0f}도 안"),
+                ("band", f"거리 {WALL_MIN_DIST_M}~{WALL_MAX_DIST_M}m 안 (= 벽 후보)")]
+        print(f"[단계별 통과 점 개수] 스캔 {len(stats)}회 평균")
+        for k, label in keys:
+            avg = sum(s[k] for s in stats) / len(stats)
+            print(f"  {label:<32} {avg:7.1f}개")
+        print(f"  한 스캔 최대 후보점 수           {best_cand:7d}개  (필요: {MIN_INLIERS}개 이상)")
+
+        print("\n[원인 추정]")
+        avg_window = sum(s["window"] for s in stats) / len(stats)
+        avg_band = sum(s["band"] for s in stats) / len(stats)
+        if avg_window < MIN_INLIERS:
+            print(f"  정면 ±{SEARCH_HALF_DEG:.0f}도 방향에 점 자체가 거의 없습니다.")
+            print("  -> 지금 오프셋이 가리키는 '정면'이 실제 벽 쪽이 아닐 가능성이 큽니다.")
+            print("     SEARCH_HALF_DEG 를 180 으로 올려서 전방향을 훑어보세요.")
+        elif avg_band < MIN_INLIERS:
+            if front_dists:
+                arr = np.array(front_dists)
+                print(f"  정면 방향에 점은 있는데({avg_window:.0f}개) 거리 조건에서 걸렸습니다.")
+                print(f"  실제 관측 거리: 최소 {arr.min():.2f}m / 중앙값 {np.median(arr):.2f}m / 최대 {arr.max():.2f}m")
+                if np.median(arr) < WALL_MIN_DIST_M:
+                    print(f"  -> 벽이 너무 가깝습니다. 로봇을 뒤로 더 물리거나 WALL_MIN_DIST_M 을 낮추세요.")
+                elif np.median(arr) > WALL_MAX_DIST_M:
+                    print(f"  -> 벽이 너무 멉니다. 로봇을 벽 쪽으로 당기거나 WALL_MAX_DIST_M 을 올리세요.")
+        else:
+            print(f"  후보점은 충분한데({avg_band:.0f}개) 직선을 못 찾았습니다.")
+            print("  -> 벽이 평평하지 않거나(굴곡/가구), 잡음이 큽니다.")
+            print(f"     RANSAC_TOL_M({RANSAC_TOL_M}m)을 0.04 정도로 올려보세요.")
         return
 
     arr = np.array(normals)
