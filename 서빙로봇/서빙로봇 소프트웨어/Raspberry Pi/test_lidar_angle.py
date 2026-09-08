@@ -98,7 +98,8 @@ try:
         cv2.putText(canvas,
                     f"Nearest: {min_dist:.2f}m  angle: {min_angle:+.1f}deg",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,100), 1)
-        mask_tag = "각도별 프로파일" if SELF_MASK is not None else f"균일 {SELF_FALLBACK_M:.2f}m (미캘리브레이션)"
+        # cv2.putText 는 한글을 못 그린다 (Hershey 폰트는 ASCII 전용) -> 반드시 영문으로
+        mask_tag = "per-angle profile" if SELF_MASK is not None else f"uniform {SELF_FALLBACK_M:.2f}m (NOT CALIBRATED)"
         cv2.putText(canvas,
                     f"Offset: {OFFSET}deg  SelfExcl: {mask_tag}",
                     (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180,180,180), 1)
