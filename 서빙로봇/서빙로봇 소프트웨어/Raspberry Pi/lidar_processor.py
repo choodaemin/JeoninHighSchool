@@ -149,6 +149,13 @@ def _lidar_worker(scan_queue: Queue, stop_event, use_mock: bool):
                             continue
                         if dist_m < config.LIDAR_MIN_RANGE_M or dist_m > config.LIDAR_MAX_RANGE_M:
                             continue
+                        # [자체반사 제외] 로봇 몸체(마운트/브래킷 등)에 라이다 빔이 맞고
+                        # 튕겨 돌아오는 반사. 실측: 로봇을 제자리에서 돌려도 0.23~0.24m
+                        # 거리의 점 무리가 로봇과 같이 회전 -> 방 안 물체가 아니라 몸체
+                        # 자체. LIDAR_MIN_RANGE_M(센서 최소 측정거리, 0.15m)만으로는
+                        # 못 걸러지므로(로봇 반경 0.25m보다 짧음) 별도 반경으로 제외한다.
+                        if dist_m < config.LIDAR_SELF_EXCLUSION_M:
+                            continue
 
                         points.append(LidarPoint(
                             angle_deg     = angle,
